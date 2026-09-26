@@ -59,6 +59,14 @@ uint f32_to_f16_rne(float f) {
 #ifdef USE_16BIT
 #define LOAD_F16(buf, i)     f16tof32((uint) (buf).Load<uint16_t>((i) * 2))
 #define STORE_F16(buf, i, v) (buf).Store<uint16_t>((i) * 2, (uint16_t) f32_to_f16_rne(v))
+#elif defined(GGML_D3D11)
+// cs_5_0 has no 16-bit loads: read the word, and write a half with two atomics so the other half is kept
+#define LOAD_F16(buf, i)     f16tof32((buf).Load(((i) * 2) & ~3u) >> ((((i) * 2) & 2u) * 8u))
+#define STORE_F16(buf, i, v) { \
+    const uint _sh = (((i) * 2) & 2u) * 8u; \
+    (buf).InterlockedAnd(((i) * 2) & ~3u, ~(0xFFFFu << _sh)); \
+    (buf).InterlockedOr(((i) * 2) & ~3u, f32_to_f16_rne(v) << _sh); \
+}
 #endif
 
 // unaligned raw loads (ByteAddressBuffer.Load ignores the low 2 address bits)

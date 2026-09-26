@@ -86,12 +86,20 @@ curl -L -o model.gguf https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGU
 curl -L -o model.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf
 ```
 
+**Mixture of experts, 822 MB** - Granite 3.0 1B A400M. Only 400M of its parameters run per token, so
+it is quick, and it exercises a different path in the backend than the two above:
+
+```
+curl -L -o model.gguf https://huggingface.co/bartowski/granite-3.0-1b-a400m-instruct-GGUF/resolve/main/granite-3.0-1b-a400m-instruct-Q4_K_M.gguf
+```
+
 Check the download is complete (`certutil -hashfile model.gguf SHA256`):
 
 | file | bytes | SHA-256 |
 |---|---:|---|
 | `SmolLM2-135M-Instruct-Q4_K_M.gguf` | 105454432 | `2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d` |
 | `qwen2.5-0.5b-instruct-q4_0.gguf` | 428730208 | `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed` |
+| `granite-3.0-1b-a400m-instruct-Q4_K_M.gguf` | 821845024 | `074f09e13484e54e73c93830d34e9fa9917a6319fb8bae762a22594b9b4da0dc` |
 
 Any `.gguf` file from Hugging Face works, not only these two. Larger models need more video
 memory; a rough rule is that the file has to fit in your card's VRAM, plus about 1 GB for the

@@ -3654,6 +3654,54 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_SCALE (the q/k norm before GATED_DELTA_NET), for backends that fuse the pair
+struct test_rms_norm_scale : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const bool v; // whether a is a non-contiguous view
+    const float eps;
+    const float s;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne, v, eps, s);
+    }
+
+    test_rms_norm_scale(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {128, 16, 1, 1},
+            bool v = false,
+            float eps = 1e-6f,
+            float s = 0.088f)
+        : type(type), ne(ne), v(v), eps(eps), s(s) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        if (v) {
+            a = ggml_view_4d(ctx, a, a->ne[0]/2, a->ne[1]/2, a->ne[2], a->ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "view of a");
+        }
+
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, a, eps), s);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM_BACK
 struct test_rms_norm_back : public test_case {
     const ggml_type type;
@@ -9674,6 +9722,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
 
+    for (bool v : { false, true }) {
+        for (float s : { 0.088f, 1.0f, -3.0f }) {
+            test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, {128, 16, 1, 1}, v, 1e-6f, s));
+            test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, {256, 5, 4, 3}, v, 1e-6f, s));
+        }
+        test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, {1025, 5, 4, 3}, v, 1e-4f, 0.5f));
+    }
+
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
@@ -10101,6 +10157,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
+
+    // odd token count, so the work count passes the 65535 per-dimension launch limit of D3D12 and Vulkan and
+    // a 2D fold rounds it up. Covers the fold arithmetic, which no other case reaches.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 2, 1, false, 12, 21847, 256));
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
@@ -10963,6 +11023,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    // K == 1: the single final state goes to the cache (decode and plain prompt path)
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128,  1, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   5, 2, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 64,  17, 1, 1));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

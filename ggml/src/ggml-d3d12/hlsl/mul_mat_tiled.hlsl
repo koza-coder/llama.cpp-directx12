@@ -14,7 +14,10 @@
 // The dequantization mirrors dequant_row.hlsli, which the matrix-vector kernel uses and which the op
 // suite covers; only the loop shape differs (a contiguous run of 32 instead of a lane-strided walk).
 //
-// defines: SRC0_{F32,F16,Q4_0,Q8_0,Q4_K,Q6_K}, SRC1_F16 (f16 columns instead of f32)
+// defines: SRC0_<TYPE>, SRC1_F16 (f16 columns instead of f32). F32, F16, Q4_0, Q8_0, Q4_K and Q6_K have
+// their own loader below; every other type with 32-value blocks uses dot_row from dequant_row.hlsli.
+// MMID: mul_mat_id. Each workgroup takes one tile of the table that mul_mat_id_prep.hlsl makes: one
+// expert and up to TILE_N of its (token, slot) pairs as the columns.
 // src0 offsets/strides are in elements for float types and in blocks for quant types.
 
 #define TILE_M 64
@@ -31,6 +34,9 @@
 RWByteAddressBuffer src1 : register(u0);
 RWByteAddressBuffer src0 : register(u1);
 RWByteAddressBuffer dst  : register(u2);
+#if defined(MMID)
+RWByteAddressBuffer scratch : register(u3);
+#endif
 
 cbuffer Params : register(b0) {
     uint offset_src0;
@@ -49,11 +55,30 @@ cbuffer Params : register(b0) {
     uint broadcast2;  // src1 dim 2 / src0 dim 2
     uint broadcast3;
     uint n_batches;   // dst ne2 * ne3; the dispatch is rounded up to a 2D grid, so it can overshoot
+#if defined(MMID)
+    uint n_used;      // ids->ne[0]
+    uint ne11;        // src1->ne[1]; the src1 row of slot s is s % ne11
+    uint dst_s1;      // dst->nb[1] in elements
+    uint dst_s2;      // dst->nb[2] in elements
+    uint list_base;   // first list entry in scratch
+#endif
     uint nwg_x;
 };
 
 groupshared float Atile[TILE_K][TILE_M];
 groupshared float Btile[TILE_K][TILE_N];
+
+#if !defined(SRC0_F32) && !defined(SRC0_F16) && !defined(SRC0_Q8_0) && !defined(SRC0_Q4_0) && \
+    !defined(SRC0_Q4_K) && !defined(SRC0_Q6_K)
+// dot_row with lane = block number and a TPR above any block count runs its loop once, for that
+// block only. ACC then writes each value straight into the Atile column of this thread.
+#define TILED_DOT_ROW
+#define TPR 0x1000000u
+#define MAX_COLS 1
+static uint g_row;
+#define ACC(a, kidx) { Atile[(kidx) % TILE_K][g_row] = (a); }
+#include "dequant_row.hlsli"
+#endif
 
 #if defined(SRC1_F16)
 float load_src1(uint i) {
@@ -197,6 +222,37 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint wg_linear = gid.y * nwg_x + gid.x;
 
     const uint tiles_m = (m + TILE_M - 1) / TILE_M;
+    // staging: threads 0..TILE_M-1 take one src0 row each, so a row is dequantized exactly once;
+    // all NTHREADS threads share the src1 tile, 8 threads per column, 4 values each
+    const uint b_col  = tid / 8;
+    const uint b_part = tid % 8;
+
+#if defined(MMID)
+    // workgroups past the tile count do no work. They do not return early: on the MTT S80 an early
+    // return before the barriers gave wrong results. Their k loop runs zero times instead.
+    const uint row0    = (wg_linear % tiles_m) * TILE_M;
+    const uint ct      = wg_linear / tiles_m;
+    const bool active  = ct < scratch.Load(0);
+    uint3      tile    = uint3(0, 0, 0);
+    if (active) {
+        tile = scratch.Load3((1 + 3 * ct) * 4);
+    }
+#if defined(GGML_D3D11)
+    // FXC refuses barriers in a loop whose count comes from a buffer load (X3663); inactive workgroups
+    // run the full loop on tile 0 and store nothing (n_cols is 0)
+    const uint k_end   = k;
+#else
+    const uint k_end   = active ? k : 0;
+#endif
+    const uint a_batch = offset_src0 + tile.x * stride_02;
+    const uint n_cols  = tile.z;
+    const bool b_ok    = b_col < n_cols;
+    uint       b_base  = 0;
+    if (b_ok) {
+        const uint pair = scratch.Load((list_base + tile.y + b_col) * 4);
+        b_base = offset_src1 + ((pair % n_used) % ne11) * stride_11 + (pair / n_used) * stride_12;
+    }
+#else
     const uint tiles_n = (n + TILE_N - 1) / TILE_N;
     const uint tile_id = wg_linear % (tiles_m * tiles_n);
     const uint batch   = wg_linear / (tiles_m * tiles_n);
@@ -215,6 +271,10 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 
     const uint a_batch = offset_src0 + src03_idx * stride_03 + src02_idx * stride_02;
     const uint b_batch = offset_src1 + dst3_idx * stride_13 + dst2_idx * stride_12;
+    const uint k_end   = k;
+    const bool b_ok    = col0 + b_col < n;
+    const uint b_base  = b_batch + (col0 + b_col) * stride_11;
+#endif
 
     float acc[REG_M][REG_N];
     [unroll] for (uint im = 0; im < REG_M; im++) {
@@ -223,14 +283,23 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
     }
 
-    // staging: threads 0..TILE_M-1 take one src0 row each, so a row is dequantized exactly once;
-    // all NTHREADS threads share the src1 tile, 8 threads per column, 4 values each
-    const uint b_col  = tid / 8;
-    const uint b_part = tid % 8;
-
-    for (uint kt = 0; kt < k; kt += TILE_K) {
+    for (uint kt = 0; kt < k_end; kt += TILE_K) {
         if (tid < TILE_M) {
             const uint r = row0 + tid;
+#if defined(TILED_DOT_ROW)
+            if (r < m) {
+                uint  src1_base[MAX_COLS];
+                float unused[MAX_COLS];
+                src1_base[0] = 0;
+                unused[0]    = 0.0f;
+                g_row        = tid;
+                dot_row(src0, a_batch + r * stride_01, kt / 32, 0, src1_base, unused);
+            } else {
+                [unroll] for (uint z = 0; z < TILE_K; z++) {
+                    Atile[z][tid] = 0.0f;
+                }
+            }
+#else
             float vals[TILE_K];
             if (r < m) {
                 load_a_row(a_batch + r * stride_01, kt, vals);
@@ -242,13 +311,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             [unroll] for (uint ki = 0; ki < TILE_K; ki++) {
                 Atile[ki][tid] = vals[ki];
             }
+#endif
         }
-        {
-            const uint c = col0 + b_col;
-            [unroll] for (uint i = 0; i < 4; i++) {
-                const uint ki = b_part * 4 + i;
-                Btile[ki][b_col] = (c < n) ? load_src1(b_batch + c * stride_11 + kt + ki) : 0.0f;
-            }
+        [unroll] for (uint i = 0; i < 4; i++) {
+            const uint ki = b_part * 4 + i;
+            Btile[ki][b_col] = b_ok ? load_src1(b_base + kt + ki) : 0.0f;
         }
         GroupMemoryBarrierWithGroupSync();
 
@@ -269,17 +336,27 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync();
     }
 
+#if !defined(MMID)
     const uint dst_base = offset_dst + dst3_idx * (m * n * batches2) + dst2_idx * (m * n);
+#endif
     [unroll] for (uint im4 = 0; im4 < REG_M; im4++) {
         const uint r = row0 + ty * REG_M + im4;
         if (r >= m) {
             continue;
         }
         [unroll] for (uint in4 = 0; in4 < REG_N; in4++) {
+#if defined(MMID)
+            const uint j = tx * REG_N + in4;
+            if (j < n_cols) {
+                const uint pair = scratch.Load((list_base + tile.y + j) * 4);
+                STORE_F32(dst, offset_dst + (pair % n_used) * dst_s1 + (pair / n_used) * dst_s2 + r, acc[im4][in4]);
+            }
+#else
             const uint c = col0 + tx * REG_N + in4;
             if (c < n) {
                 STORE_F32(dst, dst_base + c * m + r, acc[im4][in4]);
             }
+#endif
         }
     }
 }

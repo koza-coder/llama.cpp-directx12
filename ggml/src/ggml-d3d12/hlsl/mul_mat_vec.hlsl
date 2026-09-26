@@ -136,7 +136,12 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint row        = (wg_local % row_groups) * ROWS + tid / TPR;
 #if defined(MMID)
     // one (id slot, token) pair per group of row groups; the id picks the expert matrix
-    const uint pair      = wg_local / row_groups;
+    // the 2D fold rounds the group count up; the extra groups have no token. Keep them in range and drop
+    // only their store - returning early before the groupshared barriers below gives wrong results here.
+    // N_MATS is 1 for MMID, so wg_start_1 is free and carries ids->ne[1].
+    const uint pair_raw  = wg_local / row_groups;
+    const bool in_range  = pair_raw < n_used * wg_start_1;
+    const uint pair      = in_range ? pair_raw : 0;
     const uint id_slot   = pair % n_used;
     const uint token     = pair / n_used;
     const uint expert    = (uint) ids.Load((offset_ids + token * ids_s1 + id_slot) * 4);
@@ -206,7 +211,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const float4 row_result = float4(acc[0], acc[1], acc[2], acc[3]);
 #endif
 #if defined(MMID)
-    if (lane == 0 && row < mrows) {
+    if (lane == 0 && row < mrows && in_range) {
         STORE_F32(dst_0, o_dst + token * dst_s2 + id_slot * dst_s1 + row, row_result[0]);
     }
     return;

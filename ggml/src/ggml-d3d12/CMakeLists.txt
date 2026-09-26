@@ -42,3 +42,12 @@ target_link_libraries(ggml-d3d12 PRIVATE d3d12 dxgi dxguid)
 if (GGML_D3D12_DEBUG)
     target_compile_definitions(ggml-d3d12 PRIVATE GGML_D3D12_DEBUG=1)
 endif()
+
+if (GGML_D3D12_DRED_DEFAULT)
+    target_compile_definitions(ggml-d3d12 PRIVATE GGML_D3D12_DRED_DEFAULT=1)
+endif()
+
+# default for GGML_D3D12_TILED; a test build sets 1 so the op suite runs the tiled kernel
+if (DEFINED GGML_D3D12_TILED_DEFAULT)
+    target_compile_definitions(ggml-d3d12 PRIVATE GGML_D3D12_TILED_DEFAULT=${GGML_D3D12_TILED_DEFAULT})
+endif()

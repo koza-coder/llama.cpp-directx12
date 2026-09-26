@@ -7,6 +7,8 @@
 // dst holds the attention output [S_v * H * n_tokens * n_seqs] followed by K state snapshots
 // [S_v * S_v * H * n_seqs each]. With K == 1 a dispatch may cover a token range: the state continues from the
 // dst state area when t0 > 0. defines: S_V (multiple of 4), KDA
+// The states go to st (slot s at offset_st + s * st_slot_stride): the dst state area, or the recurrent cache
+// when the CPY that follows is fused (STATE_OUT: st is bound to the cache view; otherwise st is dst)
 
 RWByteAddressBuffer q_buf : register(u0);
 RWByteAddressBuffer k_buf : register(u1);
@@ -15,6 +17,11 @@ RWByteAddressBuffer g_buf : register(u3);
 RWByteAddressBuffer b_buf : register(u4);
 RWByteAddressBuffer s_buf : register(u5);
 RWByteAddressBuffer dst   : register(u6);
+#if defined(STATE_OUT)
+RWByteAddressBuffer st    : register(u7);
+#else
+#define st dst
+#endif
 
 cbuffer Params : register(b0) {
     uint offset_q;
@@ -53,6 +60,8 @@ cbuffer Params : register(b0) {
     uint t1;
     uint n_rows;             // n_seqs * n_head * S_V
     float scale;
+    uint offset_st;
+    uint st_slot_stride;
 
     uint nwg_x;
 };
@@ -71,8 +80,6 @@ void main(uint3 id : SV_DispatchThreadID) {
     const uint iq3 = iv3 / rq3;
     const uint ik3 = iv3 / rk3;
 
-    const uint attn_elems = S_V * n_head * n_tokens * (n_rows / (n_head * S_V));
-    const uint snap_elems = S_V * S_V * n_head * (n_rows / (n_head * S_V));
     const uint state_row  = (iv3 * n_head + iv1) * S_V * S_V + j * S_V;
 
     float4 row[S_V / 4];
@@ -84,7 +91,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         // K == 1: continue from the state written by the previous token range
         for (uint a2 = 0; a2 < S_V / 4; a2++) {
-            row[a2] = asfloat(dst.Load4((offset_dst + attn_elems + state_row + 4 * a2) * 4));
+            row[a2] = asfloat(st.Load4((offset_st + state_row + 4 * a2) * 4));
         }
     }
 
@@ -120,18 +127,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (n_snap > 1) {
             const int slot = (int) n_tokens - 1 - (int) t;
             if (slot >= 0 && slot < (int) n_snap) {
-                const uint o = offset_dst + attn_elems + (uint) slot * snap_elems + state_row;
+                const uint o = offset_st + (uint) slot * st_slot_stride + state_row;
                 for (uint a6 = 0; a6 < S_V; a6++) {
-                    STORE_F32(dst, o + a6, row[a6 / 4][a6 % 4]);
+                    STORE_F32(st, o + a6, row[a6 / 4][a6 % 4]);
                 }
             }
         }
     }
 
     if (n_snap == 1) {
-        const uint o1 = offset_dst + attn_elems + state_row;
+        const uint o1 = offset_st + state_row;
         for (uint a7 = 0; a7 < S_V; a7++) {
-            STORE_F32(dst, o1 + a7, row[a7 / 4][a7 % 4]);
+            STORE_F32(st, o1 + a7, row[a7 / 4][a7 % 4]);
         }
     }
 }

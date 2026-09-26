@@ -2,6 +2,7 @@
 
 // one workgroup per row: dst = src * rsqrt(mean(src^2) + eps), f32 only
 // L2_NORM: dst = src / max(sqrt(sum(src^2)), eps) instead
+// post_scale multiplies the result (1 unless a following SCALE is fused)
 // FUSE_MUL: dst *= wgt, with wgt broadcast over dims 1..3 like ggml_mul (fused RMS_NORM + MUL)
 
 RWByteAddressBuffer src : register(u0);
@@ -38,6 +39,8 @@ cbuffer Params : register(b0) {
     uint w_s2;
     uint w_s3;
 
+    float post_scale;
+
     uint nwg_x;
 };
 
@@ -73,9 +76,9 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync();
     }
 #if defined(L2_NORM)
-    const float scale = 1.0f / max(sqrt(scratch[0]), eps);   // L2_NORM: x / max(||x||, eps)
+    const float scale = post_scale / max(sqrt(scratch[0]), eps);   // L2_NORM: x / max(||x||, eps)
 #else
-    const float scale = 1.0f / sqrt(scratch[0] / (float) ne0 + eps);
+    const float scale = post_scale / sqrt(scratch[0] / (float) ne0 + eps);
 #endif
 
     for (uint c = gtid.x; c < ne0; c += WG_SIZE) {

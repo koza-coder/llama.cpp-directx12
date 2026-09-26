@@ -8,7 +8,7 @@
 // Output row = i3 * n_q * n_head + i1 * n_head + i2; a dispatch covers rows row0 .. row0 + n_rows - 1 and t is
 // the row index inside that range.
 // defines: DK, DV (head sizes, multiples of 4), K_F16, K_F32 or K_Q8_0, V_F16, V_F32 or V_Q8_0, K_ALIGNED, V_ALIGNED,
-//          HAS_MASK (f16 mask), HAS_SINKS, SOFTCAP, COMBINE
+//          HAS_MASK (f16 mask), HAS_SINKS, SOFTCAP, COMBINE, DECODE (see the second main)
 
 RWByteAddressBuffer q_buf : register(u0);
 RWByteAddressBuffer k_buf : register(u1);
@@ -83,9 +83,16 @@ cbuffer Params : register(b0) {
 // share one block (head sizes are multiples of 32)
 float4 load_q8_0_4(RWByteAddressBuffer buf, uint i) {
     const uint byte = (i / 32u) * 34u;
-    uint dbits, w;
+    uint dbits;
     LOAD_U16_UNALIGNED(buf, byte, dbits);
-    LOAD_U32_UNALIGNED(buf, byte + 2u + i % 32u, w);
+    // the 4 quants start at an even byte, so they are either 4-byte aligned or 2 bytes past it. Not
+    // LOAD_U32_UNALIGNED: with its masked form the R9700 gave wrong results and page faults for head
+    // sizes 256 and 576 (2026-09-19); why is not known.
+    const uint a = byte + 2u + i % 32u;
+    uint w = buf.Load(a & ~3u);
+    if ((a & 2u) != 0u) {
+        w = (w >> 16) | (buf.Load((a & ~3u) + 4u) << 16);
+    }
     const int4 q = (int4) (uint4(w << 24, w << 16, w << 8, w)) >> 24;
     return f16tof32(dbits) * (float4) q;
 }
@@ -120,6 +127,7 @@ float4 load_v4(uint i) {
 
 #define NEG_INF_SCORE -3.4028235e38f
 
+#if !defined(DECODE)
 [numthreads(WG_SIZE, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     const uint gi = flat_index(id, nwg_x);
@@ -190,11 +198,18 @@ void main(uint3 id : SV_DispatchThreadID) {
     const uint i1  = (row % (n_q * n_head)) / n_head;
     const uint i2  = row % n_head;
 
-    float4 q[DK / 4];
     const uint q_base = offset_q + i3 * stride_q3 + i2 * stride_q2 + i1 * stride_q1;
+#if defined(GGML_D3D11)
+    // D3D11: q is read again for each KV entry, so fewer registers are in use. With q in registers the
+    // R9700 gave NaN in acc[16] now and then (hsv=128); probably a register spill problem in the driver.
+#define Q4(a) asfloat(q_buf.Load4((q_base + 4 * (a)) * 4))
+#else
+    float4 q[DK / 4];
     for (uint a = 0; a < DK / 4; a++) {
         q[a] = asfloat(q_buf.Load4((q_base + 4 * a) * 4));
     }
+#define Q4(a) q[a]
+#endif
     const uint k_base = offset_k + (i3 / rk3) * stride_k3 + (i2 / rk2) * stride_k2;
     const uint v_base = offset_v + (i3 / rv3) * stride_v3 + (i2 / rv2) * stride_v2;
 
@@ -232,11 +247,16 @@ void main(uint3 id : SV_DispatchThreadID) {
 #endif
         float s = 0.0f;
         for (uint a = 0; a < DK / 4; a++) {
-            s += dot(q[a], load_k4(kj + 4 * a));
+            s += dot(Q4(a), load_k4(kj + 4 * a));
         }
         s *= scale;
 #if defined(SOFTCAP)
+#if defined(GGML_D3D11)
+        // tanh of a large input can give NaN (inf / inf); tanh is 1.0f past 9.01 anyway, as in unary.hlsl
+        s = logit_softcap * tanh(clamp(s, -9.010913f, 9.010913f));
+#else
         s = logit_softcap * tanh(s);
+#endif
 #endif
         s += mv;
 
@@ -274,3 +294,127 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 #endif
 }
+#else
+// DECODE: pass 1 with one workgroup per (output row, block of WG_SIZE KV entries), for few query rows. Thread
+// j scores KV entry j, then thread d sums the softmax-weighted values of output element d. Same tmp layout.
+groupshared float q_sh[DK];
+groupshared float p_sh[WG_SIZE];
+groupshared float red_sh[WG_SIZE];
+
+[numthreads(WG_SIZE, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    const uint wg  = gid.x + nwg_x * gid.y;
+    const uint tid = gtid.x;
+    if (wg >= n_rows * n_blocks) {
+        return;
+    }
+    const uint t   = wg / n_blocks;
+    const uint b   = wg % n_blocks;
+    const uint row = row0 + t;
+    const uint i3  = row / (n_q * n_head);
+    const uint i1  = (row % (n_q * n_head)) / n_head;
+    const uint i2  = row % n_head;
+
+    const uint q_base = offset_q + i3 * stride_q3 + i2 * stride_q2 + i1 * stride_q1;
+    for (uint a = tid; a < DK; a += WG_SIZE) {
+        q_sh[a] = LOAD_F32(q_buf, q_base + a);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint k_base = offset_k + (i3 / rk3) * stride_k3 + (i2 / rk2) * stride_k2;
+    const uint v_base = offset_v + (i3 / rv3) * stride_v3 + (i2 / rv2) * stride_v2;
+
+    // score of entry j; NEG_INF_SCORE when past the end or masked
+    const uint j = b * blk_size + tid;
+    float s = NEG_INF_SCORE;
+    if (j < n_kv) {
+        bool visible = true;
+        float mv = 0.0f;
+#if defined(HAS_MASK)
+        const uint m_base = offset_mask + (i3 % mask_ne3) * stride_m3 + (i2 % mask_ne2) * stride_m2 + i1 * stride_m1;
+        uint mbits;
+        LOAD_U16_UNALIGNED(mask, (m_base + j) * 2, mbits);
+        visible = mbits != 0xFC00u;
+        float slope = 1.0f;
+        if (max_bias > 0.0f) {
+            const float h = (float) i2;
+            slope = h < n_head_log2 ? pow(m0, h + 1.0f) : pow(m1, 2.0f * (h - n_head_log2) + 1.0f);
+        }
+        mv = slope * f16tof32(mbits);
+#endif
+        if (visible) {
+#if defined(K_Q8_0)
+            const uint kj = (k_base + j * stride_k1) * 32u;
+#else
+            const uint kj = k_base + j * stride_k1;
+#endif
+            float d = 0.0f;
+            for (uint a = 0; a < DK / 4; a++) {
+                d += dot(float4(q_sh[4 * a], q_sh[4 * a + 1], q_sh[4 * a + 2], q_sh[4 * a + 3]), load_k4(kj + 4 * a));
+            }
+            d *= scale;
+#if defined(SOFTCAP)
+            d = logit_softcap * tanh(d);
+#endif
+            s = d + mv;
+        }
+    }
+
+    // block maximum
+    red_sh[tid] = s;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint h = WG_SIZE / 2; h > 0; h /= 2) {
+        if (tid < h) {
+            red_sh[tid] = max(red_sh[tid], red_sh[tid + h]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const float M = red_sh[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    const float p = s <= NEG_INF_SCORE ? 0.0f : exp(s - M);
+    p_sh[tid] = p;
+    red_sh[tid] = p;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint h2 = WG_SIZE / 2; h2 > 0; h2 /= 2) {
+        if (tid < h2) {
+            red_sh[tid] += red_sh[tid + h2];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const float S = red_sh[0];
+
+    const uint base = (t * n_blocks + b) * (DV + 1);
+    if (S == 0.0f) {
+        if (tid == 0) {
+            STORE_F32(tmp, base, NEG_INF_SCORE);
+        }
+        return;
+    }
+    if (tid == 0) {
+        STORE_F32(tmp, base, M + log(S));
+    }
+    const float inv = 1.0f / S;
+    const uint  jn  = min(blk_size, n_kv - b * blk_size);
+    // thread tid owns 4 consecutive output elements per step
+    for (uint d4 = tid; d4 < DV / 4; d4 += WG_SIZE) {
+        float4 acc = 0.0f;
+        for (uint jj = 0; jj < jn; jj++) {
+            const float pj = p_sh[jj];
+            if (pj != 0.0f) {
+#if defined(V_Q8_0)
+                const uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
+#else
+                const uint vj = v_base + (b * blk_size + jj) * stride_v1;
+#endif
+                acc += pj * load_v4(vj + 4 * d4);
+            }
+        }
+        acc *= inv;
+        STORE_F32(tmp, base + 1 + 4 * d4, acc.x);
+        STORE_F32(tmp, base + 2 + 4 * d4, acc.y);
+        STORE_F32(tmp, base + 3 + 4 * d4, acc.z);
+        STORE_F32(tmp, base + 4 + 4 * d4, acc.w);
+    }
+}
+#endif
