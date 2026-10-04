@@ -1,4 +1,17 @@
-# llama.cpp
+# llama.cpp - DirectX 12 (D3D12) backend
+
+> **This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with a Direct3D 12 compute backend.**
+> It runs LLMs on Windows GPUs through their DirectX 12 driver, including GPUs without Vulkan, CUDA or ROCm support.
+>
+> - **Download:** Windows x64 zips on the [releases page](https://github.com/koza-coder/llama.cpp-directx12/releases)
+> - **Tested:** AMD Radeon AI PRO R9700 with Qwen2.5-0.5B Q4_0: prompt 7045 tok/s, generation 185 tok/s, perplexity 17.29
+> - **Build, test, settings:** [README-D3D12.md](README-D3D12.md)
+> - **Backend source:** [ggml/src/ggml-d3d12](ggml/src/ggml-d3d12)
+> - **Other versions:** [DirectX 11](https://github.com/koza-coder/llama.cpp-directx11) for older GPUs and drivers,
+>   [OpenGL](https://github.com/koza-coder/llama.cpp-opengl) - same llama.cpp, only the GPU backend differs
+>
+> Everything below is the upstream llama.cpp README.
+
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
