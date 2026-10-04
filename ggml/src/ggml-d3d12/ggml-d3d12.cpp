@@ -182,6 +182,7 @@ struct d3d12_device_ctx {
     std::vector<mem_range>            touched;
     bool                              barrier_pending = true;
     bool                              barrier_owed    = false;   // a group needed a barrier no dispatch recorded yet
+    bool                              untracked       = false;   // the last group had nodes past the range list
     bool                              all_barriers    = false;   // GGML_D3D12_ALL_BARRIERS: one per dispatch
     bool                              sync_flush  = false;   // GGML_D3D12_SYNC_FLUSH: every flush waits
     HANDLE                            fence_event = nullptr;
@@ -355,7 +356,8 @@ static void ggml_d3d12_begin(d3d12_device_ctx & dev, bool compute) {
         dev.cmd_list->SetComputeRootSignature(dev.root_sig.get());
     }
     dev.dispatch_names.clear();
-    dev.touched.clear();
+    // dev.touched is kept: a list begun mid-graph (batch flush, flash attention chunks, scratch resize) must still
+    // see the ranges of the group being encoded, or the next reader of its output skips its barrier
     dev.barrier_pending = !dev.no_barrier;
     dev.barrier_owed    = false;
     dev.recording = true;
@@ -855,7 +857,9 @@ static void ggml_d3d12_group_barrier(d3d12_device_ctx & dev, ggml_tensor * const
     const ggml_tensor * ts[32];
     bool                wr[32];
     int                 nt = 0;
-    for (int k = 0; k < n && nt + 1 + GGML_MAX_SRC <= 32; k++) {
+    int                 nk = 0;
+    for (; nk < n && nt + 1 + GGML_MAX_SRC <= 32; nk++) {
+        const int k = nk;
         ts[nt] = nodes[k];
         wr[nt] = true;
         nt++;
@@ -867,7 +871,9 @@ static void ggml_d3d12_group_barrier(d3d12_device_ctx & dev, ggml_tensor * const
             }
         }
     }
-    bool need = dev.all_barriers || n > 4 || dev.touched.size() + nt > 64;   // a long fused group: just take it
+    bool need = dev.all_barriers || dev.untracked || n > 4 || dev.touched.size() + nt > 64;   // a long fused group: just take it
+    // nodes that did not fit in ts are not recorded below, so the group after this one must take a barrier
+    dev.untracked = nk < n;
     for (int k = 0; k < nt && !need; k++) {
         if (ts[k]->data == nullptr) {
             continue;
@@ -3811,6 +3817,7 @@ static ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend, stru
     const double t0 = ggml_d3d12_time_us();
     const double submit0 = dev.t_submit_us, wait0 = dev.t_wait_us;
     ggml_d3d12_begin(dev, true);
+    dev.touched.clear();
     if (dev.n_graphs < 4 || cgraph->n_nodes != dev.last_graph_nodes) {
         // a graph of a new shape: find the pipelines it needs first and compile the missing ones in parallel
         dev.collecting = true;
