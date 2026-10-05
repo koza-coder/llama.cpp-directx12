@@ -32,6 +32,50 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         ACC(f16tof32(w1 & 0xFFFFu), i + 2);
         ACC(f16tof32(w1 >> 16), i + 3);
     }
+#elif defined(SRC0_Q4_0) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: the block as one 20-byte window (Load4 + Load) and src1 in Load4s. the generic path issues 41 scalar
+    // load messages per block, this one 13 (DX11 exp146: FXC kept them apart, tg 3.4x on Intel).
+    // Blocks start on 2 bytes: odd = the block starts at byte 2 of the window.
+    for (uint blk = lane; blk < k / 32; blk += TPR) {
+        const uint  base = (src0_base + blk) * 18;
+        const uint  a0   = base & ~3u;
+        const bool  odd  = (base & 2u) != 0;
+        const uint4 w03  = src0.Load4(a0);
+        const uint  W[5] = { w03.x, w03.y, w03.z, w03.w, src0.Load(a0 + 16) };
+        const float d    = f16tof32(odd ? (W[0] >> 16) : (W[0] & 0xFFFFu));
+        const uint  ys   = (src1_base[0] + blk * 32) * 4;
+        float       sum  = 0.0f;
+        [unroll] for (uint j = 0; j < 4; j++) {
+            const uint   q   = odd ? W[j + 1] : ((W[j] >> 16) | (W[j + 1] << 16));
+            const float4 ylo = asfloat(src1.Load4(ys + 16 * j));
+            const float4 yhi = asfloat(src1.Load4(ys + 64 + 16 * j));
+            sum += ((float) ( q        & 0xFu) - 8.0f) * ylo.x + ((float) ((q >>  8) & 0xFu) - 8.0f) * ylo.y +
+                   ((float) ((q >> 16) & 0xFu) - 8.0f) * ylo.z + ((float) ((q >> 24) & 0xFu) - 8.0f) * ylo.w +
+                   ((float) ((q >>  4) & 0xFu) - 8.0f) * yhi.x + ((float) ((q >> 12) & 0xFu) - 8.0f) * yhi.y +
+                   ((float) ((q >> 20) & 0xFu) - 8.0f) * yhi.z + ((float) ( q >> 28        ) - 8.0f) * yhi.w;
+        }
+        acc[0] += sum * d;
+    }
+#elif defined(SRC0_Q8_0) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: the 34-byte block as one 36-byte window (2x Load4 + Load) and src1 in Load4s
+    for (uint blk = lane; blk < k / 32; blk += TPR) {
+        const uint  base = (src0_base + blk) * 34;
+        const uint  a0   = base & ~3u;
+        const bool  odd  = (base & 2u) != 0;
+        const uint4 wa   = src0.Load4(a0);
+        const uint4 wb   = src0.Load4(a0 + 16);
+        const uint  W[9] = { wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w, src0.Load(a0 + 32) };
+        const float d    = f16tof32(odd ? (W[0] >> 16) : (W[0] & 0xFFFFu));
+        const uint  ys   = (src1_base[0] + blk * 32) * 4;
+        float       sum  = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const uint   q = odd ? W[j + 1] : ((W[j] >> 16) | (W[j + 1] << 16));
+            const float4 y = asfloat(src1.Load4(ys + 16 * j));
+            sum += (float) sbyte_of(q, 0) * y.x + (float) sbyte_of(q, 1) * y.y +
+                   (float) sbyte_of(q, 2) * y.z + (float) sbyte_of(q, 3) * y.w;
+        }
+        acc[0] += sum * d;
+    }
 #elif defined(SRC0_Q4_0)
     // block: f16 d, 16 bytes of nibbles; low nibbles are elements 0..15, high nibbles 16..31
     for (uint blk = lane; blk < k / 32; blk += TPR) {
@@ -476,6 +520,56 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
                 const int gv = j < 4 ? sbyte_of(IQ1S_GRID_LO[gi], j) : sbyte_of(IQ1S_GRID_HI[gi], j - 4);
                 ACC(dl * ((float) gv + delta), blk * 256 + s * 32 + l * 8 + j);
             }
+        }
+    }
+#elif defined(SRC0_TQ2_0)
+    // super-block of 256 (66 bytes): 64 bytes qs, f16 d. Value h * 128 + l * 32 + m is bits 2l..2l+1 of
+    // qs[h * 32 + m], minus 1, times d. Sub-block s (of 8) = half h = s / 4, shift l = s % 4. (port of the OpenGL path)
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 8;
+        const uint s    = sb % 8;
+        const uint h    = s / 4;
+        const uint l    = s % 4;
+        const uint base = (src0_base + blk) * 66;
+        uint dbits;
+        LOAD_U16_UNALIGNED(src0, base + 64, dbits);
+        const float d = f16tof32(dbits);
+        for (uint w = 0; w < 8; w++) {
+            uint q;
+            LOAD_U32_UNALIGNED(src0, base + h * 32 + 4 * w, q);
+            [unroll] for (uint b = 0; b < 4; b++) {
+                ACC(((float) ((byte_of(q, b) >> (2 * l)) & 3u) - 1.0f) * d, blk * 256 + h * 128 + l * 32 + w * 4 + b);
+            }
+        }
+    }
+#elif defined(SRC0_Q1_0)
+    // block of 128 (18 bytes): f16 d, 16 bytes of sign bits; bit j of the block is +d when set, -d when clear
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 4;
+        const uint s    = sb % 4;
+        const uint base = (src0_base + blk) * 18;
+        uint dbits, q;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 2 + 4 * s, q);
+        const float d = f16tof32(dbits);
+        for (uint j = 0; j < 32; j++) {
+            ACC(((q >> j) & 1u) != 0u ? d : -d, blk * 128 + s * 32 + j);
+        }
+    }
+#elif defined(SRC0_Q2_0)
+    // block of 64 (18 bytes): f16 d, 16 bytes of 2-bit codes q (4 per byte, low bits first); value = (q - 1) * d
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 2;
+        const uint s    = sb % 2;
+        const uint base = (src0_base + blk) * 18;
+        uint dbits, q0, q1;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s, q0);
+        LOAD_U32_UNALIGNED(src0, base + 6 + 8 * s, q1);
+        const float d = f16tof32(dbits);
+        for (uint j = 0; j < 16; j++) {
+            ACC(((float) ((q0 >> (2 * j)) & 3u) - 1.0f) * d, blk * 64 + s * 32 + j);
+            ACC(((float) ((q1 >> (2 * j)) & 3u) - 1.0f) * d, blk * 64 + s * 32 + 16 + j);
         }
     }
 #elif defined(SRC0_IQ1_M)

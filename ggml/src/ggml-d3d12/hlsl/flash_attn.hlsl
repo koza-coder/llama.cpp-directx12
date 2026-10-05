@@ -199,8 +199,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     const uint i2  = row % n_head;
 
     const uint q_base = offset_q + i3 * stride_q3 + i2 * stride_q2 + i1 * stride_q1;
-#if defined(GGML_D3D11)
-    // D3D11: q is read again for each KV entry, so fewer registers are in use. With q in registers the
+#if defined(GGML_D3D11) || defined(Q_FROM_MEM)
+    // D3D11 and Q_FROM_MEM: q is read again for each KV entry, so fewer registers are in use (exp162: on the Intel
+    // Iris Xe, D3D12 pass 1 holding q took 27.6 ms per call, the same pass on D3D11 6.6 ms). With q in registers the
     // R9700 gave NaN in acc[16] now and then (hsv=128); probably a register spill problem in the driver.
 #define Q4(a) asfloat(q_buf.Load4((q_base + 4 * (a)) * 4))
 #else
