@@ -9,6 +9,7 @@ RWByteAddressBuffer dst : register(u1);
 cbuffer Params : register(b0) {
     uint offset_src;
     uint offset_dst;
+    uint stride_src0;
 
     uint stride_src1;
     uint stride_src2;
@@ -46,7 +47,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     // pass 1: sum
     float sum = 0;
     for (uint col = gtid.x; col < ne0; col += WG_SIZE) {
-        sum += LOAD_F32(src, src_row + col);
+        sum += LOAD_F32(src, src_row + col * stride_src0);
     }
     scratch[gtid.x] = sum;
     GroupMemoryBarrierWithGroupSync();
@@ -61,7 +62,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     // pass 2: variance around the mean
     float var = 0;
     for (uint c2 = gtid.x; c2 < ne0; c2 += WG_SIZE) {
-        const float v = LOAD_F32(src, src_row + c2) - mean;
+        const float v = LOAD_F32(src, src_row + c2 * stride_src0) - mean;
         var += v * v;
     }
     scratch[gtid.x] = var;
@@ -75,6 +76,6 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const float scale = 1.0f / sqrt(scratch[0] / (float) ne0 + eps);
 
     for (uint c = gtid.x; c < ne0; c += WG_SIZE) {
-        STORE_F32(dst, dst_row + c, (LOAD_F32(src, src_row + c) - mean) * scale);
+        STORE_F32(dst, dst_row + c, (LOAD_F32(src, src_row + c * stride_src0) - mean) * scale);
     }
 }

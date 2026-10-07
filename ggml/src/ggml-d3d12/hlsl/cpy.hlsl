@@ -1,6 +1,6 @@
 #include "common.hlsli"
 
-// defines: SRC_{F32,F16,I32}, DST_{F32,F16,I32}
+// defines: SRC_{F32,F16,BF16,I32}, DST_{F32,F16,I32}
 
 #if defined(SRC_F32)
 #define SRC_T float
@@ -8,6 +8,10 @@
 #elif defined(SRC_F16)
 #define SRC_T float
 #define LOAD_SRC(i) LOAD_F16(src, i)
+#elif defined(SRC_BF16)
+#define SRC_T float
+float load_bf16_src(uint i);
+#define LOAD_SRC(i) load_bf16_src(i)
 #elif defined(SRC_I32)
 #define SRC_T int
 #define LOAD_SRC(i) LOAD_I32(src, i)
@@ -52,6 +56,14 @@ cbuffer Params : register(b0) {
 
     uint nwg_x;
 };
+
+#if defined(SRC_BF16)
+float load_bf16_src(uint i) {
+    uint bits;
+    LOAD_U16_UNALIGNED(src, i * 2, bits);
+    return asfloat(bits << 16);
+}
+#endif
 
 [numthreads(WG_SIZE, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {

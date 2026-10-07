@@ -266,6 +266,8 @@ struct d3d12_device_ctx {
     uint32_t tiled_min_cols   = GGML_D3D12_TILED_DEFAULT; // GGML_D3D12_TILED: columns from which the tiled kernels are used (0 = never)
     com_ptr<ID3D12Resource> mmid_scratch;          // expert lists for the tiled mul_mat_id, see mul_mat_id_prep.hlsl
     size_t                  mmid_scratch_size = 0;
+    com_ptr<ID3D12Resource> topk_scratch;          // full sorted index rows of a long TOP_K, see ggml_d3d12_argsort
+    size_t                  topk_scratch_size = 0;
     std::string disable_ops;           // GGML_D3D12_DISABLE_OPS: comma separated op names sent to the CPU
     std::mutex  rejected_mutex;
     std::map<std::string, uint64_t> rejected;   // with stats: "op src types -> type" refused by supports_op
@@ -1132,12 +1134,83 @@ static std::string ggml_d3d12_type_define(ggml_type type, const char * prefix) {
         case GGML_TYPE_F32: s += "_F32"; break;
         case GGML_TYPE_F16: s += "_F16"; break;
         case GGML_TYPE_I32: s += "_I32"; break;
+        case GGML_TYPE_BF16: s += "_BF16"; break;
         default: GGML_ABORT("ggml_d3d12: unsupported type %s", ggml_type_name(type));
     }
     return s;
 }
 
+static bool ggml_d3d12_mul_mat_vec_type(ggml_type t);
+static void ggml_d3d12_get_rows_quant(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst, bool cpyq);
+
+static uint32_t ggml_d3d12_quantize_dst_qk(ggml_type t);
+static void ggml_d3d12_quantize_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst);
+
+// CPY of f32 / f16 rows into a quantised type that set_rows_q.hlsl writes: contiguous dst, same shape, whole blocks per row
+static bool ggml_d3d12_cpy_quantize_type(const ggml_tensor * src, const ggml_tensor * dst) {
+    const uint32_t qk = ggml_d3d12_quantize_dst_qk(dst->type);
+    // f32 only, like the Vulkan backend: f16 -> q4_1 differed from the CPU at rounding ties (exp213/214)
+    return qk != 0 && src->type == GGML_TYPE_F32 &&
+           ggml_are_same_shape(src, dst) && ggml_is_contiguous(dst) && src->nb[0] == ggml_type_size(src->type) &&
+           src->ne[0] % qk == 0 && ggml_nbytes(dst) < (1ull << 31);
+}
+
+// CPY of a quantised (or bf16) source to f32: dequant through get_rows_q (rows in blocks) / the typed kernel
+static bool ggml_d3d12_cpy_dequant_type(const ggml_tensor * src, const ggml_tensor * dst) {
+    return dst->type == GGML_TYPE_F32 && ggml_is_quantized(src->type) && ggml_d3d12_mul_mat_vec_type(src->type) &&
+           ggml_are_same_shape(src, dst) && dst->nb[0] == 4 && src->ne[0] % ggml_blck_size(src->type) == 0 &&
+           src->nb[1] % ggml_type_size(src->type) == 0 && src->nb[2] % ggml_type_size(src->type) == 0 &&
+           src->nb[3] % ggml_type_size(src->type) == 0 && ggml_nrows(dst) <= UINT32_MAX / 32;
+}
+
+// a same-type copy that the typed cpy kernel cannot express (bf16, i16, i8, quantised blocks, f16 without 16-bit ops)
+static bool ggml_d3d12_cpy_raw_type(const d3d12_caps & caps, const ggml_tensor * src, const ggml_tensor * dst) {
+    const ggml_type t = src->type;
+    if (t != dst->type || t == GGML_TYPE_F32 || t == GGML_TYPE_I32 || (t == GGML_TYPE_F16 && caps.native_16bit)) {
+        return false;
+    }
+    if (ggml_blck_size(t) > 1) {
+        // blocks contiguous along dim 0 in both tensors
+        return src->nb[0] == ggml_type_size(t) && dst->nb[0] == ggml_type_size(t);
+    }
+    return true;
+}
+
+static void ggml_d3d12_cpy_raw(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    const size_t   ts   = ggml_type_size(src->type);
+    const int64_t  blck = ggml_blck_size(src->type);
+    const std::string ch = ts % 4 == 0 ? "CH4" : ts % 2 == 0 ? "CH2" : "CH1";
+    const std::vector<std::string> defines = { ch, "TS=" + std::to_string(ts) };
+    const std::string name = "cpy_raw_" + ch + "_" + std::to_string(ts);
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, name.c_str(), hlsl_cpy_raw, defines);
+
+    const d3d12_binding bsrc = ggml_d3d12_bind_tensor(src);
+    const d3d12_binding bdst = ggml_d3d12_bind_tensor(dst);
+    const uint32_t      ne   = (uint32_t) (ggml_nelements(dst) / blck);
+
+    std::vector<uint32_t> params = {
+        ne, bsrc.elem_offset, bdst.elem_offset,
+        (uint32_t) (src->nb[0] / ts), (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
+        (uint32_t) (dst->nb[0] / ts), (uint32_t) (dst->nb[1] / ts), (uint32_t) (dst->nb[2] / ts), (uint32_t) (dst->nb[3] / ts),
+        (uint32_t) (src->ne[0] / blck), (uint32_t) src->ne[1], (uint32_t) src->ne[2],
+        (uint32_t) (dst->ne[0] / blck), (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bsrc.va, bdst.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
 static void ggml_d3d12_cpy(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    if (ggml_d3d12_cpy_quantize_type(src, dst)) {
+        ggml_d3d12_quantize_rows(dev, src, nullptr, dst);
+        return;
+    }
+    if (ggml_d3d12_cpy_dequant_type(src, dst)) {
+        ggml_d3d12_get_rows_quant(dev, src, nullptr, dst, true);
+        return;
+    }
+    if (ggml_d3d12_cpy_raw_type(dev.caps, src, dst)) {
+        ggml_d3d12_cpy_raw(dev, src, dst);
+        return;
+    }
     std::vector<std::string> defines = { ggml_d3d12_type_define(src->type, "SRC"), ggml_d3d12_type_define(dst->type, "DST") };
     if (src->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F16) {
         defines.push_back("USE_16BIT");
@@ -1213,28 +1286,51 @@ static void ggml_d3d12_scale(d3d12_device_ctx & dev, ggml_tensor * src, ggml_ten
 }
 
 // SET_ROWS into q8_0 (quantized KV cache): two dispatches, rows of even and odd dst row numbers
-static void ggml_d3d12_set_rows_q8_0(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
-    std::vector<std::string> defines;
-    if (idx->type == GGML_TYPE_I64) {
+// block size of the quantised types that set_rows_q.hlsl can write, 0 for any other type
+static uint32_t ggml_d3d12_quantize_dst_qk(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL: return 32;
+        case GGML_TYPE_Q2_0: return 64;
+        case GGML_TYPE_Q1_0: return 128;
+        default: return 0;
+    }
+}
+
+// quantise rows of src into dst: SET_ROWS (idx != null) or CPY (idx == null: row i goes to row i)
+static void ggml_d3d12_quantize_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
+    std::string define = "QT_";
+    define += ggml_type_name(dst->type);
+    for (auto & ch : define) {
+        ch = (char) toupper((unsigned char) ch);
+    }
+    std::vector<std::string> defines = { define };
+    if (src->type == GGML_TYPE_F16) {
+        defines.push_back("SRC_F16");
+        defines.push_back("USE_16BIT");
+    }
+    if (idx == nullptr) {
+        defines.push_back("IDENT");
+    } else if (idx->type == GGML_TYPE_I64) {
         defines.push_back("I64_IDX");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "set_rows_q8", hlsl_set_rows_q8, defines);
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "set_rows_q", hlsl_set_rows_q, defines);
 
     const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bi = ggml_d3d12_bind_tensor(idx);
+    const d3d12_binding bi = ggml_d3d12_bind_tensor(idx ? idx : src);
     const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
     const size_t        ts = ggml_type_size(src->type);
-    const size_t        ti = ggml_type_size(idx->type);
+    const size_t        ti = idx ? ggml_type_size(idx->type) : 4;
     const size_t        td = ggml_type_size(dst->type);
     const uint32_t      n_rows = (uint32_t) (src->ne[1] * src->ne[2] * src->ne[3]);
 
     std::vector<uint32_t> params = {
         bs.elem_offset, bi.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
-        (uint32_t) (idx->nb[0] / ti), (uint32_t) (idx->nb[1] / ti), (uint32_t) (idx->nb[2] / ti),
+        idx ? (uint32_t) (idx->nb[0] / ti) : 0u, idx ? (uint32_t) (idx->nb[1] / ti) : 0u, idx ? (uint32_t) (idx->nb[2] / ti) : 0u,
         (uint32_t) (dst->nb[1] / td), (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
-        (uint32_t) idx->ne[1], (uint32_t) idx->ne[2], 0,
+        idx ? (uint32_t) idx->ne[1] : 1u, idx ? (uint32_t) idx->ne[2] : 1u, 0,
     };
     for (uint32_t parity = 0; parity < 2; parity++) {
         params.back() = parity;
@@ -1246,12 +1342,15 @@ static void ggml_d3d12_set_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_
     if (ggml_is_empty(src) || ggml_is_empty(idx)) {
         return;
     }
-    if (dst->type == GGML_TYPE_Q8_0) {
-        ggml_d3d12_set_rows_q8_0(dev, src, idx, dst);
+    if (ggml_d3d12_quantize_dst_qk(dst->type)) {
+        ggml_d3d12_quantize_rows(dev, src, idx, dst);
         return;
     }
-    std::vector<std::string> defines = { ggml_d3d12_type_define(dst->type, "DST") };
-    if (dst->type == GGML_TYPE_F16) {
+    std::vector<std::string> defines = { dst->type == GGML_TYPE_BF16 ? "DST_BF16" : ggml_d3d12_type_define(dst->type, "DST") };
+    if (src->type == GGML_TYPE_F16) {
+        defines.push_back("SRC_F16");
+    }
+    if (dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16 || src->type == GGML_TYPE_F16) {
         defines.push_back("USE_16BIT");
     }
     if (idx->type == GGML_TYPE_I64) {
@@ -1304,6 +1403,8 @@ static bool ggml_d3d12_mul_mat_vec_type(ggml_type t) {
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
             return true;
@@ -1403,9 +1504,42 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
 }
 
 // up to 3 matrices sharing src1 in one dispatch; every matrix owns a range of workgroups
+// float weights with k % 4 != 0: the vectorised kernels cannot read them, one scalar thread per dst element does
+static bool ggml_d3d12_mul_mat_scalar_needed(const ggml_tensor * src0) {
+    return !ggml_is_quantized(src0->type) && src0->ne[0] % 4 != 0;
+}
+
+static void ggml_d3d12_mul_mat_scalar(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+    std::vector<std::string> defines = { src0->type == GGML_TYPE_F32 ? "SRC0_F32" : src0->type == GGML_TYPE_F16 ? "SRC0_F16" : "SRC0_BF16" };
+    if (src1->type == GGML_TYPE_F16) {
+        defines.push_back("SRC1_F16");
+    }
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_scalar", hlsl_mul_mat_scalar, defines);
+    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const size_t        t0 = ggml_type_size(src0->type);
+    const size_t        t1 = ggml_type_size(src1->type);
+    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, bd.elem_offset,
+        (uint32_t) src0->ne[0], (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) (src0->nb[1] / t0), (uint32_t) (src0->nb[2] / t0), (uint32_t) (src0->nb[3] / t0),
+        (uint32_t) (src1->nb[1] / t1), (uint32_t) (src1->nb[2] / t1), (uint32_t) (src1->nb[3] / t1),
+        (uint32_t) (dst->ne[2] / src0->ne[2]), (uint32_t) (dst->ne[3] / src0->ne[3]),
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
 static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1, const std::vector<d3d12_mat_slot> & mats) {
     GGML_ASSERT(!mats.empty() && mats.size() <= 3);
     ggml_tensor * src0 = mats[0].src0;
+    if (ggml_d3d12_mul_mat_scalar_needed(src0)) {
+        GGML_ASSERT(mats.size() == 1 && mats[0].add == nullptr);
+        ggml_d3d12_mul_mat_scalar(dev, src0, src1, mats[0].dst);
+        return;
+    }
     // a single unfused product with many columns goes to the tiled kernel instead
     if (mats.size() == 1 && mats[0].add == nullptr &&
         ggml_d3d12_use_tiled(dev, src0, src1, mats[0].dst)) {
@@ -1563,8 +1697,33 @@ static bool ggml_d3d12_mul_mat_id_tiled(d3d12_device_ctx & dev, ggml_tensor * as
     return true;
 }
 
+static void ggml_d3d12_mul_mat_id_scalar(d3d12_device_ctx & dev, ggml_tensor * as, ggml_tensor * src1, ggml_tensor * ids,
+                                          ggml_tensor * dst) {
+    std::vector<std::string> defines = { as->type == GGML_TYPE_F32 ? "SRC0_F32" : as->type == GGML_TYPE_F16 ? "SRC0_F16" : "SRC0_BF16" };
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_id_scalar", hlsl_mul_mat_id_scalar, defines);
+    const d3d12_binding b0 = ggml_d3d12_bind_tensor(as);
+    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
+    const d3d12_binding bi = ggml_d3d12_bind_tensor(ids);
+    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const size_t        t0 = ggml_type_size(as->type);
+    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
+    const std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, bd.elem_offset, bi.elem_offset,
+        (uint32_t) as->ne[0], (uint32_t) dst->ne[0], (uint32_t) ids->ne[0],
+        (uint32_t) (as->nb[1] / t0), (uint32_t) (as->nb[2] / t0),
+        (uint32_t) (src1->nb[1] / 4), (uint32_t) (src1->nb[2] / 4), (uint32_t) src1->ne[1],
+        (uint32_t) (ids->nb[1] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4),
+        ne,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va, bi.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+}
+
 static void ggml_d3d12_mul_mat_id(d3d12_device_ctx & dev, ggml_tensor * as, ggml_tensor * src1, ggml_tensor * ids,
                                   ggml_tensor * dst) {
+    if (ggml_d3d12_mul_mat_scalar_needed(as)) {
+        ggml_d3d12_mul_mat_id_scalar(dev, as, src1, ids, dst);
+        return;
+    }
     std::string define = "SRC0_";
     define += ggml_type_name(as->type);
     for (auto & ch : define) {
@@ -1648,6 +1807,11 @@ static ggml_tensor * ggml_d3d12_fusable_addend(const ggml_tensor * mm, const ggm
 static int ggml_d3d12_encode_mul_mat_group(d3d12_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
     ggml_tensor * first = cgraph->nodes[i];
     ggml_tensor * src1  = first->src[1];
+    if (ggml_d3d12_mul_mat_scalar_needed(first->src[0])) {
+        ggml_d3d12_group_barrier(dev, cgraph->nodes + i, 1);
+        ggml_d3d12_mul_mat(dev, first->src[0], src1, first);
+        return 1;
+    }
     // long prompts: the tiled kernel alone, no grouping or ADD fusion (the matvec path made pp512 7x slower on the S80)
     if (ggml_d3d12_use_tiled(dev, first->src[0], src1, first)) {
         ggml_d3d12_group_barrier(dev, cgraph->nodes + i, 1);
@@ -1726,7 +1890,7 @@ static void ggml_d3d12_rms_norm(d3d12_device_ctx & dev, ggml_tensor * src, ggml_
     const d3d12_binding bw = wgt ? ggml_d3d12_bind_tensor(wgt) : bd;
     const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
     std::vector<uint32_t> params = {
-        bs.elem_offset, bd.elem_offset,
+        bs.elem_offset, bd.elem_offset, (uint32_t) (src->nb[0] / 4),
         (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
@@ -1748,6 +1912,73 @@ static void ggml_d3d12_argsort(d3d12_device_ctx & dev, ggml_tensor * src, ggml_t
     std::vector<std::string> defines;
     if (dst->op == GGML_OP_TOP_K || (ggml_sort_order) ggml_get_op_params_i32(dst, 0) == GGML_SORT_ORDER_DESC) {
         defines.push_back("SORT_DESC");
+    }
+    if (src->ne[0] > 1024) {
+        // long rows: bitonic network on the index array, in dst (ARGSORT) or in a scratch buffer from which the
+        // first k indices of every row are then copied to dst (TOP_K)
+        const bool topk = dst->op == GGML_OP_TOP_K;
+        std::vector<std::string> bdefs;
+        if (!defines.empty()) {
+            bdefs.push_back("SORT_DESC");
+        }
+        d3d12_pipeline & bp = ggml_d3d12_get_pipeline(dev, "argsort_bitonic", hlsl_argsort_bitonic, bdefs);
+        const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+        const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+        const uint32_t ne0   = (uint32_t) src->ne[0];
+        const uint32_t rows  = (uint32_t) ggml_nrows(src);
+        uint32_t       np2   = 1;
+        while (np2 < ne0) {
+            np2 <<= 1;
+        }
+        D3D12_GPU_VIRTUAL_ADDRESS out_va = bd.va;
+        uint32_t                  out_off = bd.elem_offset;
+        if (topk) {
+            const size_t need = (size_t) rows * ne0 * 4;
+            if (!dev.collecting && need > dev.topk_scratch_size) {
+                // commands already recorded may still use the old buffer: run them before it is replaced
+                if (dev.dispatches_in_list > 0) {
+                    ggml_d3d12_submit_and_wait(dev);
+                    ggml_d3d12_begin(dev, true);
+                }
+                if (dev.uav_table && dev.topk_scratch) {
+                    dev.va_map.erase(dev.topk_scratch->GetGPUVirtualAddress());
+                }
+                const size_t size = std::max(need, dev.topk_scratch_size * 2);
+                dev.topk_scratch  = ggml_d3d12_create_buffer(dev, size, D3D12_HEAP_TYPE_DEFAULT, L"ggml_d3d12 topk scratch");
+                GGML_ASSERT(dev.topk_scratch);
+                dev.topk_scratch_size = size;
+            }
+            out_va  = dev.topk_scratch ? dev.topk_scratch->GetGPUVirtualAddress() : 0;
+            out_off = 0;
+            // the scratch is not a tensor: the range tracking cannot see that an earlier TOP_K still reads it
+            dev.barrier_pending = !dev.no_barrier;
+        }
+        auto run = [&](uint32_t h, uint32_t flip, uint32_t mode, uint32_t total) {
+            const std::vector<uint32_t> prm = { bs.elem_offset, out_off, (uint32_t) (src->nb[1] / 4), ne0,
+                                                np2 / 2, h, flip, mode, total };
+            ggml_d3d12_dispatch(dev, bp, prm, { bs.va, out_va }, CEIL_DIV(total, (uint32_t) D3D12_WG_SIZE));
+        };
+        run(1, 0, 0, rows * ne0);
+        for (uint32_t k = 2; k <= np2; k <<= 1) {
+            for (uint32_t h = k / 2; h >= 1; h >>= 1) {
+                run(h, h == k / 2 ? 1u : 0u, 1, rows * (np2 / 2));
+            }
+        }
+        if (topk) {
+            // dst[r, i] = scratch[r, i] for i < k: a raw 4-byte copy of a k-wide view of the scratch rows
+            const uint32_t k = (uint32_t) dst->ne[0];
+            d3d12_pipeline & cp = ggml_d3d12_get_pipeline(dev, "cpy_raw_CH4_4", hlsl_cpy_raw, { "CH4", "TS=4" });
+            const uint32_t n_out = (uint32_t) ggml_nelements(dst);
+            const std::vector<uint32_t> prm = {
+                n_out, 0u, bd.elem_offset,
+                1u, ne0, ne0 * (uint32_t) src->ne[1], ne0 * (uint32_t) (src->ne[1] * src->ne[2]),
+                (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+                k, (uint32_t) src->ne[1], (uint32_t) src->ne[2],
+                k, (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+            };
+            ggml_d3d12_dispatch(dev, cp, prm, { out_va, bd.va }, CEIL_DIV(n_out, (uint32_t) D3D12_WG_SIZE));
+        }
+        return;
     }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "argsort", hlsl_argsort, defines);
     const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
@@ -1773,14 +2004,20 @@ static void ggml_d3d12_argsort(d3d12_device_ctx & dev, ggml_tensor * src, ggml_t
 }
 
 static void ggml_d3d12_repeat(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "repeat", hlsl_repeat, {});
+    const size_t esz = ggml_type_size(dst->type);
+    std::vector<std::string> defines;
+    if (esz != 4) {
+        defines.push_back("ELEM" + std::to_string(esz * 8));
+    }
+    const std::string name = esz == 4 ? "repeat" : "repeat_e" + std::to_string(esz * 8);
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, name.c_str(), hlsl_repeat, defines);
     const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
     const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
-        (uint32_t) (src->nb[0] / 4), (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
-        (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) (src->nb[0] / esz), (uint32_t) (src->nb[1] / esz), (uint32_t) (src->nb[2] / esz), (uint32_t) (src->nb[3] / esz),
+        (uint32_t) (dst->nb[0] / esz), (uint32_t) (dst->nb[1] / esz), (uint32_t) (dst->nb[2] / esz), (uint32_t) (dst->nb[3] / esz),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], ne,
     };
@@ -1814,6 +2051,9 @@ static void ggml_d3d12_im2col(d3d12_device_ctx & dev, ggml_tensor * dst) {
 }
 
 static void ggml_d3d12_im2col_3d(d3d12_device_ctx & dev, ggml_tensor * dst) {
+    if (ggml_nelements(dst) == 0) {
+        return;   // input with fewer than IC channels: N = ne[3] / IC = 0, nothing to compute
+    }
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * src    = dst->src[1];
     const int32_t *     op     = (const int32_t *) dst->op_params;
@@ -1853,8 +2093,13 @@ static void ggml_d3d12_upscale(d3d12_device_ctx & dev, ggml_tensor * src, ggml_t
         sf1 = dst->ne[1] > 1 && src->ne[1] > 1 ? (float) (dst->ne[1] - 1) / (src->ne[1] - 1) : sf1;
     }
     std::vector<std::string> defines;
-    if ((mode_flags & 0xFF) == GGML_SCALE_MODE_BILINEAR) {
+    if ((mode_flags & 0xFF) == GGML_SCALE_MODE_BILINEAR && (mode_flags & GGML_SCALE_FLAG_ANTIALIAS)) {
+        defines.push_back("ANTIALIAS");
+    } else if ((mode_flags & 0xFF) == GGML_SCALE_MODE_BILINEAR) {
         defines.push_back("BILINEAR");
+    }
+    if ((mode_flags & 0xFF) == GGML_SCALE_MODE_BICUBIC) {
+        defines.push_back("BICUBIC");
     }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "upscale", hlsl_upscale, defines);
     const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
@@ -2076,8 +2321,11 @@ static void ggml_d3d12_set_acc(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_
     if (acc) {
         defines.push_back("ACC");
     }
+    if (dst->type == GGML_TYPE_I32) {
+        defines.push_back("RAW");
+    }
     d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, acc ? "set_acc_add" : "set_acc", hlsl_set_acc, defines);
+        ggml_d3d12_get_pipeline(dev, acc ? "set_acc_add" : dst->type == GGML_TYPE_I32 ? "set_raw" : "set_acc", hlsl_set_acc, defines);
     const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
     const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(src1);
@@ -2160,13 +2408,16 @@ static void ggml_d3d12_add1(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_ten
 
 // LEAKY_RELU: negative inputs scaled by the slope in op_params
 static void ggml_d3d12_leaky_relu(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "leaky_relu", hlsl_leaky_relu, {});
+    std::vector<std::string> defines;
+    ggml_d3d12_float_type_define(dst->type, defines);
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "leaky_relu", hlsl_leaky_relu, defines);
     const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
     const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const size_t        ts = ggml_type_size(src->type);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
-        (uint32_t) (src->nb[1] / 4), (uint32_t) (dst->nb[1] / 4),
+        (uint32_t) (src->nb[1] / ts), (uint32_t) (dst->nb[1] / ts),
         (uint32_t) dst->ne[0], n_rows,
         ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
     };
@@ -2486,12 +2737,16 @@ static void ggml_d3d12_lightning_indexer(d3d12_device_ctx & dev, ggml_tensor * d
     ggml_tensor * m = dst->src[3];
 
     std::vector<std::string> defines = { "USE_16BIT" };
-    if (k->type == GGML_TYPE_F16) {
-        defines.push_back("K_F16");
+    std::string name = "lightning_indexer";
+    if (k->type != GGML_TYPE_F32) {
+        std::string t = ggml_type_name(k->type);
+        for (auto & ch : t) {
+            ch = (char) toupper((unsigned char) ch);
+        }
+        defines.push_back("K_" + t);
+        name += "_" + t;
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, k->type == GGML_TYPE_F16 ? "lightning_indexer_f16" : "lightning_indexer",
-                                hlsl_lightning_indexer, defines);
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, name.c_str(), hlsl_lightning_indexer, defines);
     const d3d12_binding bq = ggml_d3d12_bind_tensor(q);
     const d3d12_binding bk = ggml_d3d12_bind_tensor(k);
     const d3d12_binding bw = ggml_d3d12_bind_tensor(w);
@@ -2673,7 +2928,10 @@ static void ggml_d3d12_conv_transpose_2d(d3d12_device_ctx & dev, ggml_tensor * k
 }
 
 static void ggml_d3d12_col2im_1d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "col2im_1d", hlsl_col2im_1d, {});
+    const bool f16  = src->type == GGML_TYPE_F16;
+    const bool bf16 = src->type == GGML_TYPE_BF16;
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, bf16 ? "col2im_1d_bf16" : f16 ? "col2im_1d_f16" : "col2im_1d", hlsl_col2im_1d,
+                                                        bf16 ? std::vector<std::string>{ "COL_BF16" } : f16 ? std::vector<std::string>{ "COL_F16", "USE_16BIT" } : std::vector<std::string>{});
     const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
     const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
     const uint32_t k_oc = (uint32_t) src->ne[0];
@@ -2711,8 +2969,14 @@ static void ggml_d3d12_conv_2d_dw(d3d12_device_ctx & dev, ggml_tensor * knl, ggm
     if (knl->type == GGML_TYPE_F16) {
         defines = { "KNL_F16", "USE_16BIT" };
     }
+    // channels-last input (the test and ggml_conv_2d_dw_direct permute it): see the CWHN branch in the shader
+    const bool cwhn = !ggml_is_contiguous(src);
+    if (cwhn) {
+        defines.push_back("CWHN");
+    }
+    const bool f16 = knl->type == GGML_TYPE_F16;
     d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_2d_dw_f16" : "conv_2d_dw",
+        ggml_d3d12_get_pipeline(dev, cwhn ? (f16 ? "conv_2d_dw_f16_cwhn" : "conv_2d_dw_cwhn") : (f16 ? "conv_2d_dw_f16" : "conv_2d_dw"),
                                 hlsl_conv_2d_dw, defines);
     const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
     const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
@@ -2907,7 +3171,7 @@ static void ggml_d3d12_norm(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tens
     const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
     const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
-        bs.elem_offset, bd.elem_offset,
+        bs.elem_offset, bd.elem_offset, (uint32_t) (src->nb[0] / 4),
         (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
@@ -2986,21 +3250,31 @@ static void ggml_d3d12_soft_max(d3d12_device_ctx & dev, ggml_tensor * src0, ggml
 }
 
 static void ggml_d3d12_concat(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "concat", hlsl_concat, {});
+    // element sizes other than 4 bytes use an ELEMn variant: strides and offsets in units of the element size
+    const uint32_t esz  = (uint32_t) ggml_type_size(dst->type);
+    const int64_t  blck = ggml_blck_size(dst->type);   // > 1: quantised, one element is one block of esz bytes
+    std::vector<std::string> defs;
+    if (blck > 1) {
+        defs.push_back("ELEMBLK=" + std::to_string(esz));
+    } else if (esz != 4) {
+        defs.push_back("ELEM" + std::to_string(esz * 8));
+    }
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, esz == 4 && blck == 1 ? "concat" : ((blck > 1 ? "concat_b" : "concat_e") + std::to_string(blck > 1 ? esz : esz * 8)).c_str(),
+                                                        hlsl_concat, defs);
 
     const d3d12_binding b0  = ggml_d3d12_bind_tensor(src0);
     const d3d12_binding b1  = ggml_d3d12_bind_tensor(src1);
     const d3d12_binding bd  = ggml_d3d12_bind_tensor(dst);
     const int32_t       dim = ggml_get_op_params_i32(dst, 0);
-    const uint32_t      ne  = (uint32_t) ggml_nelements(dst);
+    const uint32_t      ne  = (uint32_t) (ggml_nelements(dst) / blck);
 
     const std::vector<uint32_t> params = {
-        b0.elem_offset, b1.elem_offset, bd.elem_offset,
-        (uint32_t) (src0->nb[0] / 4), (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src0->nb[3] / 4),
-        (uint32_t) (src1->nb[0] / 4), (uint32_t) (src1->nb[1] / 4), (uint32_t) (src1->nb[2] / 4), (uint32_t) (src1->nb[3] / 4),
-        (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
-        ne, (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
-        (uint32_t) dim, (uint32_t) src0->ne[dim],
+        b0.elem_offset, b1.elem_offset, bd.elem_offset,   // already in elements of the tensor type
+        (uint32_t) (src0->nb[0] / esz), (uint32_t) (src0->nb[1] / esz), (uint32_t) (src0->nb[2] / esz), (uint32_t) (src0->nb[3] / esz),
+        (uint32_t) (src1->nb[0] / esz), (uint32_t) (src1->nb[1] / esz), (uint32_t) (src1->nb[2] / esz), (uint32_t) (src1->nb[3] / esz),
+        (uint32_t) (dst->nb[0] / esz), (uint32_t) (dst->nb[1] / esz), (uint32_t) (dst->nb[2] / esz), (uint32_t) (dst->nb[3] / esz),
+        ne, (uint32_t) (dst->ne[0] / blck), (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) dim, (uint32_t) (src0->ne[dim] / (dim == 0 ? blck : 1)),
     };
     ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
 }
@@ -3029,6 +3303,26 @@ static void ggml_d3d12_ssm_conv(d3d12_device_ctx & dev, ggml_tensor * src0, ggml
 }
 
 
+// flash attention K/V types that are read as 32-element blocks (the name part of the K_/V_ define)
+static const char * ggml_d3d12_fa_block_name(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q8_0:   return "Q8_0";
+        case GGML_TYPE_Q4_0:   return "Q4_0";
+        case GGML_TYPE_Q4_1:   return "Q4_1";
+        case GGML_TYPE_Q5_0:   return "Q5_0";
+        case GGML_TYPE_Q5_1:   return "Q5_1";
+        case GGML_TYPE_IQ4_NL: return "IQ4_NL";
+        default:               return nullptr;
+    }
+}
+
+static std::string ggml_d3d12_fa_kv_define(const char * prefix, ggml_type t) {
+    if (const char * n = ggml_d3d12_fa_block_name(t)) {
+        return std::string(prefix) + n;
+    }
+    return std::string(prefix) + (t == GGML_TYPE_F16 ? "F16" : t == GGML_TYPE_BF16 ? "BF16" : "F32");
+}
+
 static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * q     = dst->src[0];
     ggml_tensor * k     = dst->src[1];
@@ -3045,8 +3339,7 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
 
     std::vector<std::string> defines = {
         "DK=" + std::to_string(k->ne[0]), "DV=" + std::to_string(v->ne[0]),
-        k->type == GGML_TYPE_F16 ? "K_F16" : k->type == GGML_TYPE_Q8_0 ? "K_Q8_0" : "K_F32",
-        v->type == GGML_TYPE_F16 ? "V_F16" : v->type == GGML_TYPE_Q8_0 ? "V_Q8_0" : "V_F32",
+        ggml_d3d12_fa_kv_define("K_", k->type), ggml_d3d12_fa_kv_define("V_", v->type),
     };
     if (mask) {
         defines.push_back("HAS_MASK");
@@ -3340,29 +3633,36 @@ static void ggml_d3d12_unary(d3d12_device_ctx & dev, ggml_tensor * src, ggml_ten
     const size_t        ts = ggml_type_size(src->type);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const bool          clamp = dst->op == GGML_OP_CLAMP;
+    const bool          xielu = dst->op == GGML_OP_UNARY && ggml_get_unary_op(dst) == GGML_UNARY_OP_XIELU;
+    const int           po    = xielu ? 1 : 0;   // XIELU keeps its four parameters at op_params 1..4
 
     std::vector<uint32_t> params = {
         ne, bs.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[0] / ts), (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2],
-        clamp ? ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)) : 0u,
-        clamp ? ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 1)) : 0u,
+        clamp || xielu ? ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, po)) : 0u,
+        clamp || xielu ? ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, po + 1)) : 0u,
+        xielu ? ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 3)) : 0u,
+        xielu ? ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 4)) : 0u,
     };
     ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
 }
 
 // GET_ROWS of a quantized source: the dequant paths of the matrix-vector kernel, TPR threads per row
-static void ggml_d3d12_get_rows_quant(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
+static void ggml_d3d12_get_rows_quant(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst, bool cpyq = false) {
     const uint32_t tpr = std::min<uint32_t>(32, dev.mm_tpr_max);
     std::string    define = "SRC0_";
     define += ggml_type_name(src->type);
     for (auto & ch : define) {
         ch = (char) toupper((unsigned char) ch);
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "get_rows_q", hlsl_get_rows_q,
-                                                        { define, "TPR=" + std::to_string(tpr) });
+    std::vector<std::string> defs = { define, "TPR=" + std::to_string(tpr) };
+    if (cpyq) {
+        defs.push_back("CPYQ");
+    }
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, cpyq ? "get_rows_q_cpy" : "get_rows_q", hlsl_get_rows_q, defs);
     const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bi = ggml_d3d12_bind_tensor(idx);
+    const d3d12_binding bi = ggml_d3d12_bind_tensor(cpyq ? dst : idx);
     const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
     const size_t        ts = ggml_type_size(src->type);
     const size_t        td = ggml_type_size(dst->type);
@@ -3371,9 +3671,9 @@ static void ggml_d3d12_get_rows_quant(d3d12_device_ctx & dev, ggml_tensor * src,
     const std::vector<uint32_t> params = {
         bs.elem_offset, bi.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
-        (uint32_t) (idx->nb[0] / 4), (uint32_t) (idx->nb[1] / 4), (uint32_t) (idx->nb[2] / 4),
+        cpyq ? 0u : (uint32_t) (idx->nb[0] / 4), cpyq ? 0u : (uint32_t) (idx->nb[1] / 4), cpyq ? 0u : (uint32_t) (idx->nb[2] / 4),
         (uint32_t) (dst->nb[1] / td), (uint32_t) (dst->nb[2] / td), (uint32_t) (dst->nb[3] / td),
-        (uint32_t) dst->ne[0], (uint32_t) idx->ne[0], (uint32_t) idx->ne[1], n_rows,
+        (uint32_t) dst->ne[0], (uint32_t) (cpyq ? src->ne[1] : idx->ne[0]), (uint32_t) (cpyq ? src->ne[2] : idx->ne[1]), n_rows,
     };
     ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(n_rows * tpr, (uint32_t) D3D12_WG_SIZE));
 }
@@ -3415,7 +3715,7 @@ static bool ggml_d3d12_unary_supported(ggml_unary_op op) {
         case GGML_UNARY_OP_GELU: case GGML_UNARY_OP_GELU_QUICK: case GGML_UNARY_OP_GELU_ERF: case GGML_UNARY_OP_SILU:
         case GGML_UNARY_OP_HARDSWISH: case GGML_UNARY_OP_HARDSIGMOID: case GGML_UNARY_OP_EXP: case GGML_UNARY_OP_SOFTPLUS:
         case GGML_UNARY_OP_EXPM1: case GGML_UNARY_OP_FLOOR: case GGML_UNARY_OP_CEIL: case GGML_UNARY_OP_ROUND:
-        case GGML_UNARY_OP_TRUNC:
+        case GGML_UNARY_OP_TRUNC: case GGML_UNARY_OP_XIELU:
             return true;
         default:
             return false;
@@ -4256,7 +4556,10 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
         case GGML_OP_CPY:
         case GGML_OP_CONT:
         case GGML_OP_DUP:
-            return type_ok(op->type) && type_ok(src0->type);
+            return (type_ok(op->type) && type_ok(src0->type)) ||
+                   (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_BF16 && ggml_nelements(op) <= UINT32_MAX) ||
+                   ggml_d3d12_cpy_dequant_type(src0, op) || ggml_d3d12_cpy_quantize_type(src0, op) ||
+                   (ggml_d3d12_cpy_raw_type(ctx->caps, src0, op) && ggml_nelements(op) <= UINT32_MAX);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -4266,14 +4569,16 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
         case GGML_OP_SCALE:
             return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32;
         case GGML_OP_SET_ROWS:
-            if (op->type == GGML_TYPE_Q8_0) {
+            if (ggml_d3d12_quantize_dst_qk(op->type)) {
                 // rows are quantized in place: contiguous dst, contiguous source rows
-                return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32) &&
-                       ggml_is_contiguous(op) && src0->nb[0] == sizeof(float) && op->ne[0] % 32 == 0 &&
+                return (src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) && (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32) &&
+                       ggml_is_contiguous(op) && src0->nb[0] == ggml_type_size(src0->type) && op->ne[0] % ggml_d3d12_quantize_dst_qk(op->type) == 0 &&
                        ggml_nbytes(op) < (1ull << 31);
             }
-            return (op->type == GGML_TYPE_F32 || (op->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
-                   src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+            // f32 or f16 rows into f32, f16 or bf16; the 16-bit types need native 16-bit shader ops
+            return (op->type == GGML_TYPE_F32 || ((op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) && ctx->caps.native_16bit)) &&
+                   (src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
+                   (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
         case GGML_OP_MUL_MAT:
             {
                 // mat-vec kernel, any column count in chunks of 4; contiguous rows required
@@ -4282,15 +4587,22 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                        (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && op->type == GGML_TYPE_F32 &&
                        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == ggml_type_size(src1->type) &&
                        (quant ? src0->ne[0] % 256 == 0 || (src0->ne[0] % 32 == 0 && ggml_blck_size(src0->type) == 32)
-                              : src0->ne[0] % 4 == 0);
+                              : (src0->ne[0] % 4 == 0 || (src0->nb[1] % ggml_type_size(src0->type) == 0 && src0->nb[2] % ggml_type_size(src0->type) == 0 &&
+                                              src0->nb[3] % ggml_type_size(src0->type) == 0 &&
+                                              src1->nb[1] % ggml_type_size(src1->type) == 0 && src1->nb[2] % ggml_type_size(src1->type) == 0 &&
+                                              src1->nb[3] % ggml_type_size(src1->type) == 0 && ggml_nelements(op) <= UINT32_MAX)));
             }
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
             // the rank kernel is quadratic in the row length: long rows (e.g. vocab sorts) stay on the CPU
             return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 && ggml_is_contiguous(op) &&
-                   ggml_is_contiguous_rows(src0) && src0->ne[0] <= 1024;
+                   ggml_is_contiguous_rows(src0) &&
+                   (src0->ne[0] <= 1024 ||
+                    (src0->ne[0] <= (1 << 22) && ggml_nrows(src0) * src0->ne[0] <= UINT32_MAX &&
+                     (op->op == GGML_OP_ARGSORT || ggml_nrows(src0) * src0->ne[0] * 4 <= (1u << 30))));
         case GGML_OP_REPEAT:
-            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && ggml_nelements(op) <= UINT32_MAX;
+            return src0->type == op->type && !ggml_is_quantized(op->type) && op->type != GGML_TYPE_I64 &&
+                   ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_IM2COL:
             return src1->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                    ggml_is_contiguous(op) && ggml_nelements(op) <= UINT32_MAX && ggml_nelements(src1) <= UINT32_MAX;
@@ -4298,6 +4610,9 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
             {
                 // IC comes from op_params, not from a shape, so it has to be sane before N is derived from it
                 const int32_t ic = ggml_get_op_params_i32(op, 9);
+                if (ggml_nelements(op) == 0) {
+                    return true;   // N = 0 (fewer than IC input channels): an empty result, like Vulkan
+                }
                 return src1->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                        src1->nb[0] == sizeof(float) && ggml_is_contiguous(op) &&
                        ic > 0 && src1->ne[3] % ic == 0 &&
@@ -4312,8 +4627,8 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
         case GGML_OP_UPSCALE: {
             const int32_t mode_flags = ggml_get_op_params_i32(op, 0);
             const int32_t mode       = mode_flags & 0xFF;
-            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && !(mode_flags & GGML_SCALE_FLAG_ANTIALIAS) &&
-                   (mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR) &&
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                   (mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR || mode == GGML_SCALE_MODE_BICUBIC) &&
                    ggml_nelements(op) <= UINT32_MAX && ggml_nelements(src0) <= UINT32_MAX;
         }
         case GGML_OP_FILL:
@@ -4407,12 +4722,15 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                    op->type == GGML_TYPE_F32 && ggml_is_scalar(src1) &&
                    src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
         case GGML_OP_LEAKY_RELU:
-            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+            return src0->type == op->type &&
+                   (op->type == GGML_TYPE_F32 || (op->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
+                   src0->nb[0] == ggml_type_size(op->type) && op->nb[0] == ggml_type_size(op->type);
         case GGML_OP_SET:
         case GGML_OP_ACC:
             // the CPU asserts the same: src0 and dst are contiguous and the same shape
-            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+            return ((src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
+                    (op->op == GGML_OP_SET && src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 &&
+                     op->type == GGML_TYPE_I32)) &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(op) && ggml_are_same_shape(src0, op) &&
                    src1->nb[0] == sizeof(float);
         case GGML_OP_ADD_ID:
@@ -4427,12 +4745,14 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                        op->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
                        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == sizeof(float) &&
                        (quant ? src0->ne[0] % 256 == 0 || (src0->ne[0] % 32 == 0 && ggml_blck_size(src0->type) == 32)
-                              : src0->ne[0] % 4 == 0);
+                              : (src0->ne[0] % 4 == 0 || (src0->nb[1] % ggml_type_size(src0->type) == 0 && src0->nb[2] % ggml_type_size(src0->type) == 0 &&
+                                              src1->nb[1] % 4 == 0 && src1->nb[2] % 4 == 0 && ids->nb[1] % 4 == 0 &&
+                                              op->nb[1] % 4 == 0 && op->nb[2] % 4 == 0 && ggml_nelements(op) <= UINT32_MAX)));
             }
         case GGML_OP_RMS_NORM:
         case GGML_OP_NORM:
         case GGML_OP_L2_NORM:
-            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(src0);
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32;
         case GGML_OP_SOFT_MAX:
             return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
                    (!src1 || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
@@ -4543,7 +4863,10 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                 const ggml_tensor * w = op->src[2];
                 const ggml_tensor * m = op->src[3];
                 return ctx->caps.native_16bit && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
-                       (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+                       (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16 ||
+                        ((src1->type == GGML_TYPE_Q8_0 || src1->type == GGML_TYPE_Q4_0 || src1->type == GGML_TYPE_Q4_1 ||
+                          src1->type == GGML_TYPE_Q5_0 || src1->type == GGML_TYPE_Q5_1 || src1->type == GGML_TYPE_IQ4_NL) &&
+                         src1->ne[0] % 32 == 0)) &&
                        w->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F16 &&
                        op->nb[0] == sizeof(float) && src0->nb[0] == sizeof(float) &&
                        src1->nb[0] == ggml_type_size(src1->type) && w->nb[0] == sizeof(float) &&
@@ -4595,8 +4918,8 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                    op->nb[0] == sizeof(float) && src0->ne[3] == src1->ne[2] &&
                    ggml_get_op_params_i32(op, 0) > 0 && ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_COL2IM_1D:
-            // f32 only; the CPU also takes f16 and bf16 columns
-            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+            // f32, bf16 (raw word access), or f16 with native 16-bit access
+            return op->type == src0->type && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || (src0->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
                    ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 0) > 0 &&
                    ggml_nelements(op) <= UINT32_MAX;
@@ -4607,11 +4930,24 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                    src0->ne[2] == src1->ne[1] && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
                    ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_CONV_2D_DW:
-            // only the WHCN path; the CWHN variant the CPU also handles has a different kernel layout
-            return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-                   (src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
-                   ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
-                   ggml_nelements(op) <= UINT32_MAX;
+            {
+                // WHCN (all contiguous) or CWHN (channels-last: element stride C, packed rows and batches, kernel [C, KW, KH])
+                const bool types_ok = op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                                      (src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
+                                      ggml_nelements(op) <= UINT32_MAX;
+                if (ggml_is_contiguous(src1)) {
+                    return types_ok && ggml_is_contiguous(src0) && ggml_is_contiguous(op);
+                }
+                auto cwhn_packed = [](const ggml_tensor * t, int64_t c) {
+                    const size_t ts = ggml_type_size(t->type);
+                    return t->nb[2] == ts && t->nb[0] == c * ts && t->nb[1] == t->ne[0] * t->nb[0] &&
+                           (t->ne[3] == 1 || t->nb[3] == t->ne[1] * t->nb[1]);
+                };
+                const int64_t ch = src1->ne[2];
+                const size_t  ks = ggml_type_size(src0->type);
+                return types_ok && ggml_is_contiguous_channels(src1) && cwhn_packed(src1, ch) && cwhn_packed(op, ch) &&
+                       src0->ne[3] == ch && src0->nb[3] == ks && src0->nb[0] == ch * ks && src0->nb[1] == src0->ne[0] * src0->nb[0];
+            }
         case GGML_OP_SSM_SCAN:
             {
                 // one thread per (sequence, head, dim); the rows it indexes directly must be packed
@@ -4635,7 +4971,10 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                 return ok;
             }
         case GGML_OP_CONCAT:
-            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_I32) && src0->type == op->type &&
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_I32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
+                    op->type == GGML_TYPE_I8 || op->type == GGML_TYPE_I16 || op->type == GGML_TYPE_I64 ||
+                    op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 || op->type == GGML_TYPE_Q5_1 ||
+                    op->type == GGML_TYPE_Q8_0) && src0->type == op->type &&
                    src1->type == op->type && ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_FLASH_ATTN_EXT:
             {
@@ -4645,11 +4984,11 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                 const ggml_tensor * m = op->src[3];
                 const ggml_tensor * s = op->src[4];
                 auto kv_ok = [](const ggml_tensor * t) {
-                    if (t->type == GGML_TYPE_Q8_0) {
+                    if (ggml_d3d12_fa_block_name(t->type)) {
                         return t->ne[0] <= 576 && t->ne[0] % 32 == 0 && t->nb[1] % ggml_type_size(t->type) == 0 &&
                                t->nb[2] % ggml_type_size(t->type) == 0 && t->nb[3] % ggml_type_size(t->type) == 0;
                     }
-                    return (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && t->nb[0] == ggml_type_size(t->type) &&
+                    return (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16) && t->nb[0] == ggml_type_size(t->type) &&
                            t->ne[0] <= 576 && t->ne[0] % 4 == 0;
                 };
                 return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float) &&
@@ -4692,6 +5031,7 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
             switch (src0->type) {
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
                     return op->type == GGML_TYPE_F32;
                 case GGML_TYPE_I32:
                     return op->type == GGML_TYPE_I32;
@@ -5015,9 +5355,11 @@ static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t gg
         /* .iface = */ {
             /* .get_name       = */ ggml_backend_d3d12_buffer_type_get_name,
             /* .alloc_buffer   = */ ggml_backend_d3d12_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n = */ NULL,
             /* .get_alignment  = */ ggml_backend_d3d12_buffer_type_get_alignment,
             /* .get_max_size   = */ ggml_backend_d3d12_buffer_type_get_max_size,
             /* .get_alloc_size = */ NULL,
+            /* .get_alloc_size_n = */ NULL,
             /* .is_host        = */ NULL,
         },
         /* .device  = */ ggml_dev,

@@ -1,11 +1,36 @@
 #include "common.hlsli"
 
-// COL2IM_1D (f32): scatter-add columns [K*OC, T_in] back to a signal [T_out, OC].
+// COL2IM_1D (f32, or f16 with -DCOL_F16 / bf16 with -DCOL_BF16 for both columns and signal): scatter-add columns [K*OC, T_in] back to a signal [T_out, OC].
 // The CPU already gathers rather than scatters, so this is a direct transcription: one thread owns
 // one output sample and sums the at most ceil(K/s) columns that overlap it.
 
 RWByteAddressBuffer src : register(u0);   // [K*OC, T_in]
 RWByteAddressBuffer dst : register(u1);   // [T_out, OC]
+
+#if defined(COL_BF16)
+// bf16 columns and signal: the top 16 bits of an f32 (rounded to nearest even, NaN kept quiet); raw word access so no
+// 16-bit loads are needed, and a half is written with two atomics so the other half is kept
+uint f32_to_bf16(float v) {
+    const uint u = asuint(v);
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u) {
+        return (u >> 16) | 0x40u;
+    }
+    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+}
+#define LOAD_COL(b, i)     asfloat(((b).Load(((i) * 2) & ~3u) >> ((((i) * 2) & 2u) * 8u)) << 16)
+#define STORE_COL(b, i, v) { \
+    const uint _h  = f32_to_bf16(v); \
+    const uint _sh = (((i) * 2) & 2u) * 8u; \
+    (b).InterlockedAnd(((i) * 2) & ~3u, ~(0xFFFFu << _sh)); \
+    (b).InterlockedOr(((i) * 2) & ~3u, _h << _sh); \
+}
+#elif defined(COL_F16)
+#define LOAD_COL(b, i)     LOAD_F16(b, i)
+#define STORE_COL(b, i, v) STORE_F16(b, i, v)
+#else
+#define LOAD_COL(b, i)     LOAD_F32(b, i)
+#define STORE_COL(b, i, v) STORE_F32(b, i, v)
+#endif
 
 cbuffer Params : register(b0) {
     uint offset_src;
@@ -44,8 +69,8 @@ void main(uint3 gid : SV_DispatchThreadID) {
     for (int c = lo; c <= hi; c++) {
         const int k = t_abs - c * s0;
         if (k >= 0 && k < (int) kk) {
-            sum += LOAD_F32(src, offset_src + (oc * kk + (uint) k) + (uint) c * k_oc);
+            sum += LOAD_COL(src, offset_src + (oc * kk + (uint) k) + (uint) c * k_oc);
         }
     }
-    STORE_F32(dst, offset_dst + i, sum);
+    STORE_COL(dst, offset_dst + i, sum);
 }

@@ -1,7 +1,7 @@
 #include "common.hlsli"
 
-// UPSCALE (f32), nearest or bilinear (with or without align corners), following the CPU reference; one thread
-// per dst element, any strides. defines: BILINEAR
+// UPSCALE (f32), nearest, bilinear or bicubic (alpha -0.75, with or without align corners), following the CPU reference; one thread
+// per dst element, any strides. defines: BILINEAR, ANTIALIAS (bilinear + antialias) or BICUBIC
 
 RWByteAddressBuffer src : register(u0);
 RWByteAddressBuffer dst : register(u1);
@@ -31,6 +31,12 @@ cbuffer Params : register(b0) {
     uint  nwg_x;
 };
 
+float cubic_w1(float x) { return ((-0.75f + 2.0f) * x - (-0.75f + 3.0f)) * x * x + 1.0f; }
+float cubic_w2(float x) { return ((-0.75f * x + 3.75f) * x - 6.0f) * x + 3.0f; }
+float cubic(float p0, float p1, float p2, float p3, float x) {
+    return p0 * cubic_w2(x + 1.0f) + p1 * cubic_w1(x) + p2 * cubic_w1(1.0f - x) + p3 * cubic_w2(2.0f - x);
+}
+
 [numthreads(WG_SIZE, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint i = flat_index(gid, nwg_x);
@@ -49,7 +55,55 @@ void main(uint3 gid : SV_DispatchThreadID) {
     const uint base = offset_src + i02 * stride_src2 + i03 * stride_src3;
     const uint o    = offset_dst + i0 * stride_dst0 + i1 * stride_dst1 + i2 * stride_dst2 + i3 * stride_dst3;
 
-#if defined(BILINEAR)
+#if defined(BICUBIC)
+    const float y  = ((float) i1 + pixel_offset) / sf1 - pixel_offset;
+    const int   y0 = (int) floor(y);
+    const float dy = y - (float) y0;
+    const float x  = ((float) i0 + pixel_offset) / sf0 - pixel_offset;
+    const int   x0 = (int) floor(x);
+    const float dx = x - (float) x0;
+    float rows[4];
+    [unroll] for (int r = 0; r < 4; r++) {
+        const uint yy = (uint) clamp(y0 + r - 1, 0, (int) src_ne1 - 1);
+        float p[4];
+        [unroll] for (int c = 0; c < 4; c++) {
+            const uint xx = (uint) clamp(x0 + c - 1, 0, (int) src_ne0 - 1);
+            p[c] = LOAD_F32(src, base + xx * stride_src0 + yy * stride_src1);
+        }
+        rows[r] = cubic(p[0], p[1], p[2], p[3], dx);
+    }
+    STORE_F32(dst, o, cubic(rows[0], rows[1], rows[2], rows[3], dy));
+#elif defined(ANTIALIAS)
+    // bilinear with antialiasing (triangle filter, PyTorch-style), same order of operations as the CPU reference
+    const float support1  = max(1.0f, 1.0f / sf1);
+    const float invscale1 = 1.0f / support1;
+    const float support0  = max(1.0f, 1.0f / sf0);
+    const float invscale0 = 1.0f / support0;
+    const float y = ((float) i1 + pixel_offset) / sf1;
+    const float x = ((float) i0 + pixel_offset) / sf0;
+    const int x_min = max((int) (x - support0 + pixel_offset), 0);
+    const int x_max = min((int) (x + support0 + pixel_offset), (int) src_ne0);
+    const int y_min = max((int) (y - support1 + pixel_offset), 0);
+    const int y_max = min((int) (y + support1 + pixel_offset), (int) src_ne1);
+    float val = 0.0f;
+    float total_weight = 0.0f;
+    for (int sy = y_min; sy < y_max; sy++) {
+        const float weight_y = max(1.0f - abs(((float) sy - y + pixel_offset) * invscale1), 0.0f);
+        for (int sx = x_min; sx < x_max; sx++) {
+            const float weight_x = max(1.0f - abs(((float) sx - x + pixel_offset) * invscale0), 0.0f);
+            const float weight = weight_x * weight_y;
+            if (weight <= 0.0f) {
+                continue;
+            }
+            val += LOAD_F32(src, base + (uint) sx * stride_src0 + (uint) sy * stride_src1) * weight;
+            total_weight += weight;
+        }
+    }
+    if (total_weight > 0.0f) {
+        val /= total_weight;
+    }
+    STORE_F32(dst, o, val);
+#elif defined(BILINEAR)
     const float y  = ((float) i1 + pixel_offset) / sf1 - pixel_offset;
     const int   fy = (int) floor(y);
     const int   y0 = clamp(fy, 0, (int) src_ne1 - 1);

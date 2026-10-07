@@ -43,6 +43,32 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (i >= ne) {
         return;
     }
+#ifdef CWHN
+    // channels-last: element i = ((b * dst_h + y) * dst_w + x) * channels + ic; kernel (ky * knl_w + kx) * channels + ic
+    const uint ic = i % channels;
+    uint       t  = i / channels;
+    const uint cx = t % dst_w;
+    t /= dst_w;
+    const uint cy = t % dst_h;
+    const uint cb = t / dst_h;
+    float csum = 0.0f;
+    for (uint ky = 0; ky < knl_h; ky++) {
+        const int sy = (int) cy * stride_y + (int) ky * dilation_y - pad_y;
+        if (sy < 0 || sy >= (int) src_h) {
+            continue;
+        }
+        for (uint kx = 0; kx < knl_w; kx++) {
+            const int sx = (int) cx * stride_x + (int) kx * dilation_x - pad_x;
+            if (sx < 0 || sx >= (int) src_w) {
+                continue;
+            }
+            csum += LOAD_KNL(offset_knl + (ky * knl_w + kx) * channels + ic) *
+                    LOAD_F32(src, offset_src + ((cb * src_h + (uint) sy) * src_w + (uint) sx) * channels + ic);
+        }
+    }
+    STORE_F32(dst, offset_dst + i, csum);
+    return;
+#endif
     const uint plane = dst_w * dst_h;
     const uint c     = i / plane;            // channel within the batch, flattened as ic + ib * channels
     const uint rem   = i % plane;

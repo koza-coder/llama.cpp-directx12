@@ -2,7 +2,7 @@
 
 // SET / ACC (f32), second phase only: dst already holds a copy of src0, and this writes src1 into
 // the view of dst described by (view_nb1, view_nb2, view_nb3, view_offset), all in elements.
-// With ACC defined the value is added instead of assigned. One workgroup per src1 row.
+// With ACC defined the value is added instead of assigned; RAW copies the 4 bytes unchanged (SET of i32). One workgroup per src1 row.
 
 RWByteAddressBuffer src1 : register(u0);
 RWByteAddressBuffer dst  : register(u1);
@@ -39,11 +39,15 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint dst_row = offset_dst + view_offset + i3 * view_nb3 + i2 * view_nb2 + i1 * view_nb1;
 
     for (uint c = gtid.x; c < ne10; c += WG_SIZE) {
+#ifdef RAW
+        dst.Store((dst_row + c) * 4, src1.Load((src_row + c) * 4));
+#else
         const float v = LOAD_F32(src1, src_row + c);
 #ifdef ACC
         STORE_F32(dst, dst_row + c, LOAD_F32(dst, dst_row + c) + v);
 #else
         STORE_F32(dst, dst_row + c, v);
+#endif
 #endif
     }
 }

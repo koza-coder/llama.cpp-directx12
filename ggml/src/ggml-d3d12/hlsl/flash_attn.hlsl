@@ -79,6 +79,13 @@ cbuffer Params : register(b0) {
     out = f16tof32(uint4(_w0 & 0xFFFFu, _w0 >> 16, _w1 & 0xFFFFu, _w1 >> 16)); \
 }
 
+#if defined(K_Q8_0) || defined(K_Q4_0) || defined(K_Q4_1) || defined(K_Q5_0) || defined(K_Q5_1) || defined(K_IQ4_NL)
+#define K_BLOCK
+#endif
+#if defined(V_Q8_0) || defined(V_Q4_0) || defined(V_Q4_1) || defined(V_Q5_0) || defined(V_Q5_1) || defined(V_IQ4_NL)
+#define V_BLOCK
+#endif
+
 // q8_0 K/V: offsets and strides are in blocks, element i = block * 32 + index in block; the 4 elements always
 // share one block (head sizes are multiples of 32)
 float4 load_q8_0_4(RWByteAddressBuffer buf, uint i) {
@@ -97,10 +104,99 @@ float4 load_q8_0_4(RWByteAddressBuffer buf, uint i) {
     return f16tof32(dbits) * (float4) q;
 }
 
+// q4_0 / q4_1 / q5_0 / q5_1 / iq4_nl K/V: 32-element blocks, element i = block * 32 + index in block. The 4 elements
+// share one block and one half (low or high nibbles); block sizes are even, so 4-byte reads start on an even byte.
+uint load_u32_even(RWByteAddressBuffer buf, uint a) {
+    uint w = buf.Load(a & ~3u);
+    if ((a & 2u) != 0u) {
+        w = (w >> 16) | (buf.Load((a & ~3u) + 4u) << 16);
+    }
+    return w;
+}
+
+uint4 nib4(uint w, uint p) {
+    const uint n = p >= 16u ? (w >> 4) : w;
+    return uint4(n & 15u, (n >> 8) & 15u, (n >> 16) & 15u, (n >> 24) & 15u);
+}
+
+float4 load_q4_0_4(RWByteAddressBuffer buf, uint i) {
+    const uint byte = (i / 32u) * 18u;
+    const uint p = i % 32u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(buf, byte, dbits);
+    const uint4 n = nib4(load_u32_even(buf, byte + 2u + (p & 15u)), p);
+    return f16tof32(dbits) * ((float4) n - 8.0f);
+}
+
+float4 load_q4_1_4(RWByteAddressBuffer buf, uint i) {
+    const uint byte = (i / 32u) * 20u;
+    const uint p = i % 32u;
+    uint dbits, mbits;
+    LOAD_U16_UNALIGNED(buf, byte, dbits);
+    LOAD_U16_UNALIGNED(buf, byte + 2u, mbits);
+    const uint4 n = nib4(load_u32_even(buf, byte + 4u + (p & 15u)), p);
+    return f16tof32(dbits) * (float4) n + f16tof32(mbits);
+}
+
+float4 load_q5_0_4(RWByteAddressBuffer buf, uint i) {
+    const uint byte = (i / 32u) * 22u;
+    const uint p = i % 32u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(buf, byte, dbits);
+    const uint qh = load_u32_even(buf, byte + 2u) >> p;
+    const uint4 hi = uint4(qh << 4, qh << 3, qh << 2, qh << 1) & 16u;
+    const uint4 n = nib4(load_u32_even(buf, byte + 6u + (p & 15u)), p) | hi;
+    return f16tof32(dbits) * ((float4) n - 16.0f);
+}
+
+float4 load_q5_1_4(RWByteAddressBuffer buf, uint i) {
+    const uint byte = (i / 32u) * 24u;
+    const uint p = i % 32u;
+    uint dbits, mbits;
+    LOAD_U16_UNALIGNED(buf, byte, dbits);
+    LOAD_U16_UNALIGNED(buf, byte + 2u, mbits);
+    const uint qh = load_u32_even(buf, byte + 4u) >> p;
+    const uint4 hi = uint4(qh << 4, qh << 3, qh << 2, qh << 1) & 16u;
+    const uint4 n = nib4(load_u32_even(buf, byte + 8u + (p & 15u)), p) | hi;
+    return f16tof32(dbits) * (float4) n + f16tof32(mbits);
+}
+
+static const int iq4_nl_vals[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+
+float4 load_iq4_nl_4(RWByteAddressBuffer buf, uint i) {
+    const uint byte = (i / 32u) * 18u;
+    const uint p = i % 32u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(buf, byte, dbits);
+    const uint4 n = nib4(load_u32_even(buf, byte + 2u + (p & 15u)), p);
+    return f16tof32(dbits) * float4(iq4_nl_vals[n.x], iq4_nl_vals[n.y], iq4_nl_vals[n.z], iq4_nl_vals[n.w]);
+}
+
+float4 load_bf16_4(RWByteAddressBuffer buf, uint i) {
+    uint b0, b1, b2, b3;
+    LOAD_U16_UNALIGNED(buf, i * 2u, b0);
+    LOAD_U16_UNALIGNED(buf, i * 2u + 2u, b1);
+    LOAD_U16_UNALIGNED(buf, i * 2u + 4u, b2);
+    LOAD_U16_UNALIGNED(buf, i * 2u + 6u, b3);
+    return asfloat(uint4(b0, b1, b2, b3) << 16);
+}
+
 float4 load_k4(uint i) {
     float4 r;
 #if defined(K_Q8_0)
     r = load_q8_0_4(k_buf, i);
+#elif defined(K_Q4_0)
+    r = load_q4_0_4(k_buf, i);
+#elif defined(K_Q4_1)
+    r = load_q4_1_4(k_buf, i);
+#elif defined(K_Q5_0)
+    r = load_q5_0_4(k_buf, i);
+#elif defined(K_Q5_1)
+    r = load_q5_1_4(k_buf, i);
+#elif defined(K_IQ4_NL)
+    r = load_iq4_nl_4(k_buf, i);
+#elif defined(K_BF16)
+    r = load_bf16_4(k_buf, i);
 #elif defined(K_F16) && defined(K_ALIGNED)
     F16_LOAD4_ALIGNED(k_buf, i, r);
 #elif defined(K_F16)
@@ -115,6 +211,18 @@ float4 load_v4(uint i) {
     float4 r;
 #if defined(V_Q8_0)
     r = load_q8_0_4(v_buf, i);
+#elif defined(V_Q4_0)
+    r = load_q4_0_4(v_buf, i);
+#elif defined(V_Q4_1)
+    r = load_q4_1_4(v_buf, i);
+#elif defined(V_Q5_0)
+    r = load_q5_0_4(v_buf, i);
+#elif defined(V_Q5_1)
+    r = load_q5_1_4(v_buf, i);
+#elif defined(V_IQ4_NL)
+    r = load_iq4_nl_4(v_buf, i);
+#elif defined(V_BF16)
+    r = load_bf16_4(v_buf, i);
 #elif defined(V_F16) && defined(V_ALIGNED)
     F16_LOAD4_ALIGNED(v_buf, i, r);
 #elif defined(V_F16)
@@ -241,7 +349,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         mv = slope * f16tof32(mbits);
 #endif
-#if defined(K_Q8_0)
+#if defined(K_BLOCK)
         const uint kj = (k_base + j * stride_k1) * 32u;
 #else
         const uint kj = k_base + j * stride_k1;
@@ -261,7 +369,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 #endif
         s += mv;
 
-#if defined(V_Q8_0)
+#if defined(V_BLOCK)
         const uint vj = (v_base + j * stride_v1) * 32u;
 #else
         const uint vj = v_base + j * stride_v1;
@@ -344,7 +452,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         mv = slope * f16tof32(mbits);
 #endif
         if (visible) {
-#if defined(K_Q8_0)
+#if defined(K_BLOCK)
             const uint kj = (k_base + j * stride_k1) * 32u;
 #else
             const uint kj = k_base + j * stride_k1;
@@ -403,7 +511,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         for (uint jj = 0; jj < jn; jj++) {
             const float pj = p_sh[jj];
             if (pj != 0.0f) {
-#if defined(V_Q8_0)
+#if defined(V_BLOCK)
                 const uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
 #else
                 const uint vj = v_base + (b * blk_size + jj) * stride_v1;

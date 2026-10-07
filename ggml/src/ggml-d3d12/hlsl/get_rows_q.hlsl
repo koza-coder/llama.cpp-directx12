@@ -3,6 +3,7 @@
 // GET_ROWS for quantized src: dst[i1, i2, i3] = dequantize(src[idx[i1, i2, i3], i2, i3]), idx is i32, dst f32.
 // TPR threads share one row and dequantize every TPR-th sub-block, reusing the matrix-vector dequant paths.
 // src offsets and strides are in blocks. defines: SRC0_<TYPE>, TPR
+// CPYQ: used by CPY quantized -> f32: row = i1 (idx buffer unused), ne1/ne2 = src ne1/ne2
 
 #define MAX_COLS 1
 
@@ -54,7 +55,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
     const uint i2 = r / ne1;
     const uint i1 = r % ne1;
 
+#ifdef CPYQ
+    const uint row = i1;
+#else
     const uint row = (uint) LOAD_I32(idx, offset_idx + i1 * stride_idx0 + i2 * stride_idx1 + i3 * stride_idx2);
+#endif
     g_dst_base     = offset_dst + i1 * stride_dst1 + i2 * stride_dst2 + i3 * stride_dst3;
 
     uint  src1_base[MAX_COLS];

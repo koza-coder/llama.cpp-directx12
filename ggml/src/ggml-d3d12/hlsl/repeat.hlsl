@@ -1,6 +1,8 @@
 #include "common.hlsli"
 
-// REPEAT (f32): dst[i0, i1, i2, i3] = src[i0 % ne00, i1 % ne01, i2 % ne02, i3 % ne03], any strides
+// REPEAT as raw bits: dst[i0, i1, i2, i3] = src[i0 % ne00, i1 % ne01, i2 % ne02, i3 % ne03], any strides
+// 4-byte elements (f32, i32); ELEM16 2-byte (f16, bf16, i16), ELEM8 1-byte (i8): strides and offsets are then in units
+// of the element size, a half or byte is written with two atomics so the neighbouring elements are kept
 
 RWByteAddressBuffer src : register(u0);
 RWByteAddressBuffer dst : register(u1);
@@ -41,6 +43,19 @@ void main(uint3 gid : SV_DispatchThreadID) {
     const uint i0 = i % ne0;
     const uint s = offset_src + (i0 % src_ne0) * stride_src0 + (i1 % src_ne1) * stride_src1 +
                    (i2 % src_ne2) * stride_src2 + (i3 % src_ne3) * stride_src3;
-    STORE_F32(dst, offset_dst + i0 * stride_dst0 + i1 * stride_dst1 + i2 * stride_dst2 + i3 * stride_dst3,
-              LOAD_F32(src, s));
+    const uint d = offset_dst + i0 * stride_dst0 + i1 * stride_dst1 + i2 * stride_dst2 + i3 * stride_dst3;
+#if defined(ELEM16)
+    uint bits;
+    LOAD_U16_UNALIGNED(src, s * 2, bits);
+    const uint sh = ((d * 2) & 2u) * 8u;
+    dst.InterlockedAnd((d * 2) & ~3u, ~(0xFFFFu << sh));
+    dst.InterlockedOr((d * 2) & ~3u, bits << sh);
+#elif defined(ELEM8)
+    const uint bits = (src.Load(s & ~3u) >> ((s & 3u) * 8u)) & 0xFFu;
+    const uint sh = (d & 3u) * 8u;
+    dst.InterlockedAnd(d & ~3u, ~(0xFFu << sh));
+    dst.InterlockedOr(d & ~3u, bits << sh);
+#else
+    dst.Store(d * 4, src.Load(s * 4));
+#endif
 }

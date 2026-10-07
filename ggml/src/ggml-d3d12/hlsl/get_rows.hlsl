@@ -1,7 +1,7 @@
 #include "common.hlsli"
 
 // dst[i1, i2, i3] = src[idx[i1, i2, i3], i2, i3]; idx is i32, one thread per element.
-// defines: SRC_{F32,F16,I32}; quantized sources use get_rows_q.hlsl
+// defines: SRC_{F32,F16,BF16,I32}; quantized sources use get_rows_q.hlsl
 
 RWByteAddressBuffer src : register(u0);
 RWByteAddressBuffer idx : register(u1);
@@ -58,5 +58,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint bits;
     LOAD_U16_UNALIGNED(src, (src_row + u) * 2, bits);
     STORE_F32(dst, dst_row + u, f16tof32(bits));
+#elif defined(SRC_BF16)
+    uint bits;
+    LOAD_U16_UNALIGNED(src, (src_row + u) * 2, bits);
+    STORE_F32(dst, dst_row + u, asfloat(bits << 16));
 #endif
 }

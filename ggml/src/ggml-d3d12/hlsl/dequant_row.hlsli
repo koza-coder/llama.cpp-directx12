@@ -10,6 +10,23 @@ float e8m0_to_f32_half(uint e) {
     return asfloat(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23));
 }
 
+// ue4m3 scale (nvfp4), halved like ggml_ue4m3_to_fp32 to match the doubled e2m1 table
+float ue4m3_to_f32_half(uint x) {
+    if (x == 0u || x == 0x7Fu) {
+        return 0.0f;
+    }
+    const uint e = (x >> 3) & 0xFu;
+    const uint m = x & 7u;
+    const float raw = e == 0u ? (float) m * (1.0f / 512.0f) : asfloat(((e + 120u) << 23) | (m << 20));
+    return raw * 0.5f;
+}
+
+static const uint POW3_TQ1[5] = { 1, 3, 9, 27, 81 };
+// one ternary digit of a tq1_0 byte: ((byte * 3^n) & 255) * 3 >> 8, minus 1
+float tq1_digit(uint b, uint n) {
+    return (float) ((((b * POW3_TQ1[n]) & 0xFFu) * 3u) >> 8) - 1.0f;
+}
+
 static const float KVALUES_IQ4NL[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
 // partial dot products of one src0 row against the active columns of src1, strided by lane
 void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, uint src1_base[MAX_COLS],
@@ -708,6 +725,58 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             LOAD_U32_UNALIGNED(src0, base + h * 32 + 4 * w, q);
             [unroll] for (uint b = 0; b < 4; b++) {
                 ACC(((float) ((byte_of(q, b) >> (2 * l)) & 3u) - 1.0f) * d, blk * 256 + h * 128 + l * 32 + w * 4 + b);
+            }
+        }
+    }
+#elif defined(SRC0_NVFP4)
+    // block of 64 (36 bytes): 4 ue4m3 scale bytes (one per 16 values), 32 bytes of nibbles; sub-block s holds
+    // values s*16 + j (low nibble) and s*16 + 8 + j (high nibble) of bytes 8s..8s+7
+    for (uint sb = lane; sb < k / 16; sb += TPR) {
+        const uint blk  = sb / 4;
+        const uint s    = sb % 4;
+        const uint base = (src0_base + blk) * 36;
+        uint sc;
+        LOAD_U32_UNALIGNED(src0, base, sc);
+        const float d = ue4m3_to_f32_half(byte_of(sc, s));
+        [unroll] for (uint w = 0; w < 2; w++) {
+            uint q;
+            LOAD_U32_UNALIGNED(src0, base + 4 + 8 * s + 4 * w, q);
+            [unroll] for (uint b = 0; b < 4; b++) {
+                const uint byte = byte_of(q, b);
+                ACC(KVALUES_MXFP4[byte & 0xFu] * d, blk * 64 + s * 16 + w * 4 + b);
+                ACC(KVALUES_MXFP4[byte >> 4] * d, blk * 64 + s * 16 + 8 + w * 4 + b);
+            }
+        }
+    }
+#elif defined(SRC0_TQ1_0)
+    // block of 256 (54 bytes): qs[48] (5 digits per byte), qh[4] (4 digits per byte), f16 d.
+    // 14 units per block: t 0-4 = digit n of qs bytes 0-31 (values n*32 + m); t 5-9 = digit n of qs bytes 32-47
+    // (values 160 + n*16 + m); t 10-13 = digit n of qh (values 240 + n*4 + j)
+    for (uint sb = lane; sb < (k / 256) * 14; sb += TPR) {
+        const uint blk  = sb / 14;
+        const uint t    = sb % 14;
+        const uint base = (src0_base + blk) * 54;
+        uint dbits;
+        LOAD_U16_UNALIGNED(src0, base + 52, dbits);
+        const float d = f16tof32(dbits);
+        if (t < 10) {
+            const uint n    = t % 5;
+            const uint boff = t < 5 ? 0u : 32u;
+            const uint cnt  = t < 5 ? 8u : 4u;
+            const uint vbase = t < 5 ? n * 32 : 160 + n * 16;
+            for (uint w = 0; w < cnt; w++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, base + boff + 4 * w, q);
+                [unroll] for (uint b = 0; b < 4; b++) {
+                    ACC(tq1_digit(byte_of(q, b), n) * d, blk * 256 + vbase + w * 4 + b);
+                }
+            }
+        } else {
+            const uint n = t - 10;
+            uint q;
+            LOAD_U32_UNALIGNED(src0, base + 48, q);
+            [unroll] for (uint b = 0; b < 4; b++) {
+                ACC(tq1_digit(byte_of(q, b), n) * d, blk * 256 + 240 + n * 4 + b);
             }
         }
     }

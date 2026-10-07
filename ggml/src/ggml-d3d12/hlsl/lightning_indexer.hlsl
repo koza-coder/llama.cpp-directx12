@@ -1,11 +1,12 @@
 #include "common.hlsli"
 
-// LIGHTNING_INDEXER (f32 q/w, f32 or f16 k, f16 mask, f32 dst):
+// LIGHTNING_INDEXER (f32 q/w, f32, f16, bf16 or quantised k, f16 mask, f32 dst):
 //   dst[s, t, ik] = sum over heads of max(dot(q[s, t, h], k[s, ik]), 0) * w[s, t, h] + mask[s, t, ik]
 //
 // The weights are prescaled by the caller, so there is nothing to normalise afterwards and every
 // destination element is independent: one thread each. The mask is always f16, so this kernel
-// always needs USE_16BIT. defines: K_F16
+// always needs USE_16BIT. defines: K_F16, K_BF16, K_Q8_0, K_Q4_0, K_Q4_1, K_Q5_0, K_Q5_1, K_IQ4_NL (quantised: stride_k2 etc.
+// count blocks, the element is dequantised on the fly).
 
 RWByteAddressBuffer q_buf : register(u0);   // {n_embd, n_head, n_tokens, n_stream}
 RWByteAddressBuffer k_buf : register(u1);   // {n_embd, *, n_kv, n_stream}
@@ -39,10 +40,73 @@ cbuffer Params : register(b0) {
     uint nwg_x;
 };
 
-#ifdef K_F16
-#define LOAD_K(i) LOAD_F16(k_buf, (i))
+#if defined(K_F16)
+#define KVAL(row, e) LOAD_F16(k_buf, (row) + (e))
+#elif defined(K_BF16)
+float k_bf16(uint i) {
+    uint bits;
+    LOAD_U16_UNALIGNED(k_buf, i * 2, bits);
+    return asfloat(bits << 16);
+}
+#define KVAL(row, e) k_bf16((row) + (e))
+#elif defined(K_Q8_0) || defined(K_Q4_0) || defined(K_Q4_1) || defined(K_Q5_0) || defined(K_Q5_1) || defined(K_IQ4_NL)
+static const float KVALUES_IQ4NL[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+
+uint k_byte(uint a) {
+    return (k_buf.Load(a & ~3u) >> ((a & 3u) * 8u)) & 0xFFu;
+}
+
+// element e of the row whose first block is number `row` (blocks of 32 values)
+float k_quant(uint row, uint e) {
+    const uint j = e & 31u;
+#if defined(K_Q8_0)
+    const uint base = (row + (e >> 5)) * 34u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(k_buf, base, dbits);
+    int q = (int) k_byte(base + 2u + j);
+    q = q > 127 ? q - 256 : q;
+    return (float) q * f16tof32(dbits);
+#elif defined(K_Q4_0) || defined(K_IQ4_NL)
+    const uint base = (row + (e >> 5)) * 18u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(k_buf, base, dbits);
+    const uint b   = k_byte(base + 2u + (j & 15u));
+    const uint nib = j < 16u ? (b & 0xFu) : (b >> 4);
+#if defined(K_IQ4_NL)
+    return KVALUES_IQ4NL[nib] * f16tof32(dbits);
 #else
-#define LOAD_K(i) LOAD_F32(k_buf, (i))
+    return ((float) nib - 8.0f) * f16tof32(dbits);
+#endif
+#elif defined(K_Q4_1)
+    const uint base = (row + (e >> 5)) * 20u;
+    uint dbits, mbits;
+    LOAD_U16_UNALIGNED(k_buf, base, dbits);
+    LOAD_U16_UNALIGNED(k_buf, base + 2u, mbits);
+    const uint b   = k_byte(base + 4u + (j & 15u));
+    const uint nib = j < 16u ? (b & 0xFu) : (b >> 4);
+    return (float) nib * f16tof32(dbits) + f16tof32(mbits);
+#elif defined(K_Q5_0)
+    const uint base = (row + (e >> 5)) * 22u;
+    uint dbits, qh;
+    LOAD_U16_UNALIGNED(k_buf, base, dbits);
+    LOAD_U32_UNALIGNED(k_buf, base + 2u, qh);
+    const uint b = k_byte(base + 6u + (j & 15u));
+    const uint x = (j < 16u ? (b & 0xFu) : (b >> 4)) | (((qh >> j) & 1u) << 4);
+    return ((float) x - 16.0f) * f16tof32(dbits);
+#else   // K_Q5_1
+    const uint base = (row + (e >> 5)) * 24u;
+    uint dbits, mbits, qh;
+    LOAD_U16_UNALIGNED(k_buf, base, dbits);
+    LOAD_U16_UNALIGNED(k_buf, base + 2u, mbits);
+    LOAD_U32_UNALIGNED(k_buf, base + 4u, qh);
+    const uint b = k_byte(base + 8u + (j & 15u));
+    const uint x = (j < 16u ? (b & 0xFu) : (b >> 4)) | (((qh >> j) & 1u) << 4);
+    return (float) x * f16tof32(dbits) + f16tof32(mbits);
+#endif
+}
+#define KVAL(row, e) k_quant((row), (e))
+#else
+#define KVAL(row, e) LOAD_F32(k_buf, (row) + (e))
 #endif
 
 [numthreads(WG_SIZE, 1, 1)]
@@ -65,7 +129,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
         const uint q_row = q_pos + h * stride_q1;
         float qk = 0.0f;
         for (uint e = 0; e < n_embd; e++) {
-            qk += LOAD_F32(q_buf, q_row + e) * LOAD_K(k_row + e);
+            qk += LOAD_F32(q_buf, q_row + e) * KVAL(k_row, e);
         }
         score += max(qk, 0.0f) * LOAD_F32(w_buf, w_row + h);
     }

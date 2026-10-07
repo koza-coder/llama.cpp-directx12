@@ -29,6 +29,8 @@ cbuffer Params : register(b0) {
 
     float p0;   // clamp min
     float p1;   // clamp max
+    float p2;   // xielu: beta
+    float p3;   // xielu: eps
 
     uint nwg_x;
 };
@@ -96,6 +98,9 @@ float apply(float x) {
     return sin(x);
 #elif defined(COS)
     return cos(x);
+#elif defined(XIELU)
+    // p0 = beta + softplus(alpha_n), p1 = softplus(alpha_p) (op_params 1, 2 of the node)
+    return x > 0.0f ? p1 * x * x + p2 * x : (exp(min(x, p3)) - 1.0f - x) * p0 + p2 * x;
 #endif
 }
 

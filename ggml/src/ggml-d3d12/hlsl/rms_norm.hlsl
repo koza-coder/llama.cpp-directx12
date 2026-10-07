@@ -14,6 +14,7 @@ RWByteAddressBuffer wgt : register(u2);
 cbuffer Params : register(b0) {
     uint offset_src;
     uint offset_dst;
+    uint stride_src0;
 
     uint stride_src1;
     uint stride_src2;
@@ -64,7 +65,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 
     float sum = 0;
     for (uint col = gtid.x; col < ne0; col += WG_SIZE) {
-        const float v = LOAD_F32(src, src_row + col);
+        const float v = LOAD_F32(src, src_row + col * stride_src0);
         sum += v * v;
     }
     scratch[gtid.x] = sum;
@@ -82,7 +83,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 #endif
 
     for (uint c = gtid.x; c < ne0; c += WG_SIZE) {
-        float v = LOAD_F32(src, src_row + c) * scale;
+        float v = LOAD_F32(src, src_row + c * stride_src0) * scale;
 #if defined(FUSE_MUL)
         v *= LOAD_F32(wgt, w_row + c);
 #endif

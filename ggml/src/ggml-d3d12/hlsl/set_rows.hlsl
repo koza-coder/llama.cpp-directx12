@@ -1,11 +1,28 @@
 #include "common.hlsli"
 
-// dst[idx[row]] = src[row]; src is f32, defines: DST_{F32,F16}, I64_IDX (low 32 bits of the index are used)
+// dst[idx[row]] = src[row]; src is f32, or f16 with SRC_F16; defines: DST_{F32,F16,BF16}, I64_IDX (low 32 bits of
+// the index are used). F16 and BF16 (src or dst) need USE_16BIT.
+// f32 -> bf16: round to nearest even, a NaN stays a NaN
 
 #if defined(DST_F32)
 #define STORE_DST(i, v) STORE_F32(dst, i, v)
 #elif defined(DST_F16)
 #define STORE_DST(i, v) STORE_F16(dst, i, v)
+#elif defined(DST_BF16)
+uint f32_to_bf16_bits(float f) {
+    const uint x = asuint(f);
+    if ((x & 0x7FFFFFFFu) > 0x7F800000u) {
+        return (x >> 16) | 0x40u;
+    }
+    return (x + 0x7FFFu + ((x >> 16) & 1u)) >> 16;
+}
+#define STORE_DST(i, v) dst.Store<uint16_t>((i) * 2, (uint16_t) f32_to_bf16_bits(v))
+#endif
+
+#ifdef SRC_F16
+#define LOAD_SRC(i) LOAD_F16(src, i)
+#else
+#define LOAD_SRC(i) LOAD_F32(src, i)
 #endif
 
 RWByteAddressBuffer src : register(u0);
@@ -68,5 +85,5 @@ void main(uint3 gid : SV_DispatchThreadID) {
     const uint i_dst_row = offset_dst + idx_val * stride_dst1 + i_src2 * stride_dst2 + i_src3 * stride_dst3;
     const uint i_src_row = offset_src + i_src1 * stride_src1 + i_src2 * stride_src2 + i_src3 * stride_src3;
 
-    STORE_DST(i_dst_row + col, LOAD_F32(src, i_src_row + col));
+    STORE_DST(i_dst_row + col, LOAD_SRC(i_src_row + col));
 }
