@@ -202,6 +202,119 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             }
         }
     }
+#elif defined(SRC0_Q4_K) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: header and nibbles as Load4s (144-byte blocks are 16-byte aligned), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint  blk  = sb / 8;
+        const uint  s    = sb % 8;
+        const uint  base = (src0_base + blk) * 144;
+        const uint4 hd   = src0.Load4(base);
+        const float d    = f16tof32(hd.x & 0xFFFFu);
+        const float dmin = f16tof32(hd.x >> 16);
+        uint sc, mn;
+        if (s < 4) {
+            sc = byte_of(hd.y, s) & 63u;
+            mn = byte_of(hd.z, s) & 63u;
+        } else {
+            sc = (byte_of(hd.w, s - 4) & 0xFu) | ((byte_of(hd.y, s - 4) >> 6) << 4);
+            mn = (byte_of(hd.w, s - 4) >> 4) | ((byte_of(hd.z, s - 4) >> 6) << 4);
+        }
+        const uint  shift = (s & 1u) * 4u;
+        const uint  qbase = base + 16 + 32 * (s / 2);
+        const uint4 q0    = src0.Load4(qbase);
+        const uint4 q1    = src0.Load4(qbase + 16);
+        const uint  Q[8]  = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+        const uint  ys    = (src1_base[0] + blk * 256 + s * 32) * 4;
+        float sq = 0.0f, sy = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const float4 y = asfloat(src1.Load4(ys + 16 * j));
+            const uint   q = Q[j] >> shift;
+            sq += (float) (q & 0xFu) * y.x + (float) ((q >> 8) & 0xFu) * y.y +
+                  (float) ((q >> 16) & 0xFu) * y.z + (float) ((q >> 24) & 0xFu) * y.w;
+            sy += y.x + y.y + y.z + y.w;
+        }
+        acc[0] += d * (float) sc * sq - dmin * (float) mn * sy;
+    }
+#elif defined(SRC0_Q6_K) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: ql and qh as 36-byte windows (2x Load4 + Load; 210-byte blocks start on 2 bytes), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk  = sb / 8;
+        const uint s    = sb % 8;
+        const uint h    = s / 4;
+        const uint t    = s % 4;
+        const uint base = (src0_base + blk) * 210;
+        uint dbits;
+        LOAD_U16_UNALIGNED(src0, base + 208, dbits);
+        const float d = f16tof32(dbits);
+        const uint  ql_base = base + 64 * h + 32 * (t & 1u);
+        const uint  qh_base = base + 128 + 32 * h;
+        const uint  sc_base = base + 192 + 8 * h + 2 * t;
+        const uint  lshift  = (t >> 1) * 4u;
+        const uint  hshift  = t * 2u;
+        uint scw;
+        LOAD_U32_UNALIGNED(src0, sc_base, scw);
+        const bool  odd  = (base & 2u) != 0;   // ql_base and qh_base share base's 4-byte phase
+        const uint  la   = ql_base & ~3u;
+        const uint  ha   = qh_base & ~3u;
+        const uint4 l0   = src0.Load4(la);
+        const uint4 l1   = src0.Load4(la + 16);
+        const uint4 h0   = src0.Load4(ha);
+        const uint4 h1   = src0.Load4(ha + 16);
+        const uint  L[9] = { l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w, src0.Load(la + 32) };
+        const uint  H[9] = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w, src0.Load(ha + 32) };
+        const uint  ys   = (src1_base[0] + blk * 256 + s * 32) * 4;
+        float sum0 = 0.0f, sum1 = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const uint   ql = odd ? ((L[j] >> 16) | (L[j + 1] << 16)) : L[j];
+            const uint   qh = odd ? ((H[j] >> 16) | (H[j + 1] << 16)) : H[j];
+            const float4 y  = asfloat(src1.Load4(ys + 16 * j));
+            float p = 0.0f;
+            [unroll] for (uint b = 0; b < 4; b++) {
+                const int q = (int) (((byte_of(ql, b) >> lshift) & 0xFu) | (((byte_of(qh, b) >> hshift) & 3u) << 4)) - 32;
+                p += (float) q * y[b];
+            }
+            if (j < 4) { sum0 += p; } else { sum1 += p; }
+        }
+        acc[0] += d * ((float) sbyte_of(scw, 0) * sum0 + (float) sbyte_of(scw, 1) * sum1);
+    }
+#elif defined(SRC0_Q5_K) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: header, qh and ql as Load4s (176-byte blocks are 16-byte aligned), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint  blk  = sb / 8;
+        const uint  s    = sb % 8;
+        const uint  base = (src0_base + blk) * 176;
+        const uint4 hd   = src0.Load4(base);
+        const float d    = f16tof32(hd.x & 0xFFFFu);
+        const float dmin = f16tof32(hd.x >> 16);
+        uint sc, mn;
+        if (s < 4) {
+            sc = byte_of(hd.y, s) & 63u;
+            mn = byte_of(hd.z, s) & 63u;
+        } else {
+            sc = (byte_of(hd.w, s - 4) & 0xFu) | ((byte_of(hd.y, s - 4) >> 6) << 4);
+            mn = (byte_of(hd.w, s - 4) >> 4) | ((byte_of(hd.z, s - 4) >> 6) << 4);
+        }
+        const uint  shift = (s & 1u) * 4u;
+        const uint  qbase = base + 48 + 32 * (s / 2);
+        const uint4 q0    = src0.Load4(qbase);
+        const uint4 q1    = src0.Load4(qbase + 16);
+        const uint4 h0    = src0.Load4(base + 16);
+        const uint4 h1    = src0.Load4(base + 32);
+        const uint  Q[8]  = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+        const uint  H[8]  = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w };
+        const uint  ys    = (src1_base[0] + blk * 256 + s * 32) * 4;
+        float sq = 0.0f, sy = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const float4 y = asfloat(src1.Load4(ys + 16 * j));
+            const uint   q = (Q[j] >> shift) & 0x0F0F0F0Fu;
+            const uint   h = ((H[j] >> s) & 0x01010101u) << 4;   // bit s of each qh byte -> +16
+            const uint   v = q | h;
+            sq += (float) (v & 0xFFu) * y.x + (float) ((v >> 8) & 0xFFu) * y.y +
+                  (float) ((v >> 16) & 0xFFu) * y.z + (float) (v >> 24) * y.w;
+            sy += y.x + y.y + y.z + y.w;
+        }
+        acc[0] += d * (float) sc * sq - dmin * (float) mn * sy;
+    }
 #elif defined(SRC0_Q4_K)
     // super-block of 256: f16 d, f16 dmin, 12 bytes of 6-bit scales/mins, 128 bytes of nibbles.
     // sub-block s (32 values): pair s/2 uses bytes 16 + 32*(s/2), low nibbles for even s, high for odd s.
@@ -275,6 +388,37 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             }
         }
     }
+#elif defined(SRC0_Q2_K) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: scales, d/dmin and the 2-bit quants as Loads (84-byte blocks are 4-byte aligned), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint  blk  = sb / 8;
+        const uint  s    = sb % 8;
+        const uint  base = (src0_base + blk) * 84;
+        const uint  w    = src0.Load(base + 80);
+        const float d    = f16tof32(w & 0xFFFFu);
+        const float dmin = f16tof32(w >> 16);
+        const uint  scw  = (src0.Load(base + 4 * (s / 2)) >> (16u * (s % 2u))) & 0xFFFFu;
+        const float dl0  = d * (float) (scw & 0xFu);
+        const float ml0  = dmin * (float) ((scw >> 4) & 0xFu);
+        const float dl1  = d * (float) ((scw >> 8) & 0xFu);
+        const float ml1  = dmin * (float) (scw >> 12);
+        const uint  shift = 2u * (s % 4u);
+        const uint  qbase = base + 16 + 32 * (s / 4);
+        const uint4 q0   = src0.Load4(qbase);
+        const uint4 q1   = src0.Load4(qbase + 16);
+        const uint  Q[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+        const uint  ys   = (src1_base[0] + blk * 256 + s * 32) * 4;
+        float sqa = 0.0f, sya = 0.0f, sqb = 0.0f, syb = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const float4 y = asfloat(src1.Load4(ys + 16 * j));
+            const uint   v = (Q[j] >> shift) & 0x03030303u;
+            const float  sq = (float) (v & 0xFFu) * y.x + (float) ((v >> 8) & 0xFFu) * y.y +
+                              (float) ((v >> 16) & 0xFFu) * y.z + (float) (v >> 24) * y.w;
+            const float  sy = y.x + y.y + y.z + y.w;
+            if (j < 4) { sqa += sq; sya += sy; } else { sqb += sq; syb += sy; }
+        }
+        acc[0] += dl0 * sqa - ml0 * sya + dl1 * sqb - ml1 * syb;
+    }
 #elif defined(SRC0_Q2_K)
     // super-block of 256 (84 bytes): 16 bytes of 4-bit scale/min pairs, 64 bytes of 2-bit quants, f16 d, f16 dmin.
     // sub-block s: values e < 16 use scale byte 2s, e >= 16 use 2s + 1; quant byte 16 + 32 * (s / 4) + e, shift 2 * (s % 4).
@@ -342,6 +486,31 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
                 ACC(dl * (float) qv, blk * 256 + s * 32 + j * 4 + b);
             }
         }
+    }
+#elif defined(SRC0_IQ4_XS) && defined(ONE_COL) && !defined(SRC1_F16)
+    // single column: header and the 16 nibble bytes of the sub-block as Loads (136-byte blocks are 4-byte aligned), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint  blk  = sb / 8;
+        const uint  s    = sb % 8;
+        const uint  base = (src0_base + blk) * 136;
+        const uint2 hd   = src0.Load2(base);
+        const float d    = f16tof32(hd.x & 0xFFFFu);
+        const uint  ls   = ((byte_of(hd.y, s / 2) >> (4 * (s % 2))) & 0xFu) | ((((hd.x >> 16) >> (2 * s)) & 3u) << 4);
+        const float dl   = d * ((float) ls - 32.0f);
+        const uint4 q    = src0.Load4(base + 8 + 16 * s);
+        const uint  Q[4] = { q.x, q.y, q.z, q.w };
+        const uint  ys   = (src1_base[0] + blk * 256 + s * 32) * 4;
+        float sum = 0.0f;
+        [unroll] for (uint j = 0; j < 4; j++) {
+            const float4 ylo = asfloat(src1.Load4(ys + 16 * j));
+            const float4 yhi = asfloat(src1.Load4(ys + 64 + 16 * j));
+            const uint   w   = Q[j];
+            sum += KVALUES_IQ4NL[w & 0xFu] * ylo.x + KVALUES_IQ4NL[(w >> 8) & 0xFu] * ylo.y +
+                   KVALUES_IQ4NL[(w >> 16) & 0xFu] * ylo.z + KVALUES_IQ4NL[(w >> 24) & 0xFu] * ylo.w +
+                   KVALUES_IQ4NL[(w >> 4) & 0xFu] * yhi.x + KVALUES_IQ4NL[(w >> 12) & 0xFu] * yhi.y +
+                   KVALUES_IQ4NL[(w >> 20) & 0xFu] * yhi.z + KVALUES_IQ4NL[w >> 28] * yhi.w;
+        }
+        acc[0] += dl * sum;
     }
 #elif defined(SRC0_IQ4_XS)
     // super-block of 256 (136 bytes): f16 d, u16 scales_h, 4 bytes scales_l, 128 bytes of table nibbles.
