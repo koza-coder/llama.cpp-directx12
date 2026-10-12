@@ -1,0 +1,59 @@
+name: Bug or GPU report
+description: Something goes wrong on your GPU (crash, wrong output, slow, not found) - or it works and you want to say so.
+title: "<GPU>: "
+labels: ["bug-unconfirmed"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        This repository is the DirectX 12 backend fork of llama.cpp. Problems that also happen with the official
+        llama.cpp release (CPU, CUDA, Vulkan, ...) belong upstream at https://github.com/ggml-org/llama.cpp/issues.
+        A report that a GPU works is welcome too.
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      placeholder: "GPU name, driver version (Device Manager -> Display adapters -> Properties -> Driver)"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Release
+      description: The zip you downloaded (or the commit you built).
+      placeholder: "e.g. v0.2.2"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows version
+      placeholder: "e.g. Windows 11 24H2"
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      description: The exact command line, and the model file name (with the Hugging Face link if you have it).
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened
+      description: What you expected and what you got. For wrong output, does the same command with `-ngl 0` (CPU only) give correct output?
+    validations:
+      required: true
+  - type: textarea
+    id: devices
+    attributes:
+      label: Output of `llama-bench.exe --list-devices`
+      render: shell
+  - type: textarea
+    id: log
+    attributes:
+      label: Full output
+      description: >
+        The complete console output. If you can, run once more with `set GGML_D3D12_STATS=1` first; it lists the
+        ops that ran on the CPU. For a failing op, `test-backend-ops.exe test -b D3D120 -o <OP>` output helps most.
+      render: shell
