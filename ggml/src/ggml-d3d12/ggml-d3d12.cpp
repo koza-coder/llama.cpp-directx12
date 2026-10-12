@@ -49,6 +49,14 @@
 #endif
 
 // Below 16 columns the matvec kernel is as fast or faster (MTT S80 pp8 -9%, R9700 pp2 -27%, 2026-09-21)
+// exp361: MUL_MAT_ID tiled gate (tokens), separate from the dense MUL_MAT gate; env GGML_D3D12_TILED_MMID
+#ifndef GGML_D3D12_TILED_MMID_DEFAULT
+#define GGML_D3D12_TILED_MMID_DEFAULT 16
+#endif
+// exp361: word-window mat-vec for 2..4 columns per dispatch (Q4_0, Q8_0); env GGML_D3D12_MV_MULTI (0 = off)
+#ifndef GGML_D3D12_MV_MULTI_DEFAULT
+#define GGML_D3D12_MV_MULTI_DEFAULT 1
+#endif
 #ifndef GGML_D3D12_TILED_DEFAULT
 #define GGML_D3D12_TILED_DEFAULT    16
 #endif
@@ -264,6 +272,9 @@ struct d3d12_device_ctx {
     bool     no_fuse          = false; // GGML_D3D12_NO_FUSE: encode every node on its own, for bisecting
     uint32_t mm_tpr_max       = D3D12_WG_SIZE; // GGML_D3D12_MM_TPR: cap on matvec threads per row (1 = no reduction tree)
     uint32_t tiled_min_cols   = GGML_D3D12_TILED_DEFAULT; // GGML_D3D12_TILED: columns from which the tiled kernels are used (0 = never)
+    uint32_t tiled_mmid_min_cols = GGML_D3D12_TILED_MMID_DEFAULT; // GGML_D3D12_TILED_MMID: same for MUL_MAT_ID (exp361)
+    bool     mv_multi         = GGML_D3D12_MV_MULTI_DEFAULT != 0; // GGML_D3D12_MV_MULTI (exp361)
+    uint32_t tiled_type_cols[GGML_TYPE_COUNT] = {}; // exp368: dense tiled gate per weight type (device x type table in the device init); 0 = tiled_min_cols
     com_ptr<ID3D12Resource> mmid_scratch;          // expert lists for the tiled mul_mat_id, see mul_mat_id_prep.hlsl
     size_t                  mmid_scratch_size = 0;
     com_ptr<ID3D12Resource> topk_scratch;          // full sorted index rows of a long TOP_K, see ggml_d3d12_argsort
@@ -1459,7 +1470,9 @@ static bool ggml_d3d12_tiled_type(ggml_type t) {
 // handful of columns the matvec kernel wins, because a tile of 32 columns would be mostly padding.
 static bool ggml_d3d12_use_tiled(const d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                  ggml_tensor * dst) {
-    return dev.tiled_min_cols != 0 && (uint32_t) dst->ne[1] >= dev.tiled_min_cols &&
+    const uint32_t t_cols = (uint32_t) src0->type < (uint32_t) GGML_TYPE_COUNT ? dev.tiled_type_cols[src0->type] : 0;   // exp368
+    const uint32_t gate   = t_cols != 0 ? t_cols : dev.tiled_min_cols;
+    return gate != 0 && (uint32_t) dst->ne[1] >= gate &&
            ggml_d3d12_tiled_type(src0->type) && src0->ne[0] % 32 == 0 &&
            (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32;
 }
@@ -1566,9 +1579,16 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     // deterministic) while F16 and the quant types passed the same shape; cause not found yet.
     const bool     one_col  = mats[0].dst->ne[1] == 1 && src0->type != GGML_TYPE_F32;
     const uint32_t max_cols = one_col ? 1 : 4;
+    // exp361: 2..4 columns with the word-window kernels (each weight word decoded once, FMA into up to 4 columns)
+    const bool multi_col = dev.mv_multi && !one_col && mats[0].dst->ne[1] > 1 &&
+                           (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) &&
+                           src0->ne[0] % 32 == 0 && src1->type == GGML_TYPE_F32;
     std::vector<std::string> defines = { define, "TPR=" + std::to_string(tpr), "N_MATS=" + std::to_string(mats.size()) };
-    if (one_col) {
+    if (one_col || multi_col) {
         defines.push_back("ONE_COL");
+    }
+    if (multi_col) {
+        defines.push_back("MULTI_COL");
     }
     // On the AMD Vega iGPU every N_MATS=2 kernel without FUSE_ADD hung the GPU (DEVICE_HUNG, 2026-09-19); taking
     // the FUSE_ADD variant for groups (add_flag 0 skips the add at run time) avoids it. Why the variant matters is
@@ -1639,7 +1659,7 @@ static bool ggml_d3d12_mul_mat_id_tiled(d3d12_device_ctx & dev, ggml_tensor * as
     const uint32_t n_tokens  = (uint32_t) ids->ne[1];
     const uint32_t n_experts = (uint32_t) as->ne[2];
     // MAX_EXPERTS in mul_mat_id_prep.hlsl
-    if (dev.tiled_min_cols == 0 || n_tokens < dev.tiled_min_cols || n_experts > 1024 || as->ne[3] != 1 ||
+    if (dev.tiled_mmid_min_cols == 0 || n_tokens < dev.tiled_mmid_min_cols || n_experts > 1024 || as->ne[3] != 1 ||
         !ggml_d3d12_tiled_type(as->type) || as->ne[0] % 32 != 0 || src1->type != GGML_TYPE_F32 ||
         dst->nb[0] != sizeof(float)) {
         return false;
@@ -3889,6 +3909,11 @@ static int ggml_d3d12_encode_gdn_cache(d3d12_device_ctx & dev, const ggml_cgraph
 // encodes the node at index i, fused with following nodes when possible; returns the number of nodes consumed
 static int ggml_d3d12_encode_nodes(d3d12_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
     ggml_tensor * node = cgraph->nodes[i];
+    // a node that is not marked for compute belongs to a branch ggml_build_forward_select did not pick (the
+    // mixed token/embd input): its inputs were never set, so running it reads garbage (device hung on the R9700)
+    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return 1;
+    }
     if (!ggml_is_empty(node)) {
         if (node->op == GGML_OP_ADD) {
             const int n = ggml_d3d12_encode_multi_add(dev, cgraph, i);
@@ -5186,6 +5211,24 @@ static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t gg
     if (const char * env = getenv("GGML_D3D12_TILED")) {
         // column count from which the tiled prompt kernel takes over; 1 means "always when eligible"
         dev.tiled_min_cols = (uint32_t) std::max(0, atoi(env));
+        dev.tiled_mmid_min_cols = dev.tiled_min_cols;   // as before exp361: GGML_D3D12_TILED sets both gates
+    }
+    if (const char * env = getenv("GGML_D3D12_TILED_MMID")) {
+        dev.tiled_mmid_min_cols = (uint32_t) std::max(0, atoi(env));
+    }
+    if (const char * env = getenv("GGML_D3D12_MV_MULTI")) {
+        dev.mv_multi = atoi(env) != 0;
+    }
+    // exp368: dense tiled gate per device x weight type, same table as DX11 exp365 (Intel: tiled from 5 columns for Q4_0, Q8_0, Q4_K, Q6_K;
+    // AMD: Q6_K from 5; other types and devices keep the default 16). GGML_D3D12_TILED (any value) switches the table off.
+    if (getenv("GGML_D3D12_TILED") == nullptr) {
+        if (dev.vendor_id == 0x8086) {
+            for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+                dev.tiled_type_cols[t] = 5;
+            }
+        } else if (dev.vendor_id == 0x1002) {
+            dev.tiled_type_cols[GGML_TYPE_Q6_K] = 5;
+        }
     }
     if (const char * env = getenv("GGML_D3D12_DISABLE_OPS")) {
         dev.disable_ops = std::string(",") + env + ",";

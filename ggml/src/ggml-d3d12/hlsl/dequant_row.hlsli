@@ -49,6 +49,37 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         ACC(f16tof32(w1 & 0xFFFFu), i + 2);
         ACC(f16tof32(w1 >> 16), i + 3);
     }
+#elif defined(SRC0_Q4_0) && defined(ONE_COL) && defined(MULTI_COL) && !defined(SRC1_F16)
+    // 2..MAX_COLS columns: the single-column window kernel below, each weight word decoded once and used for every
+    // active column (exp360). Same arithmetic order per column as the single-column kernel.
+    for (uint blk = lane; blk < k / 32; blk += TPR) {
+        const uint  base = (src0_base + blk) * 18;
+        const uint  a0   = base & ~3u;
+        const bool  odd  = (base & 2u) != 0;
+        const uint4 w03  = src0.Load4(a0);
+        const uint  W[5] = { w03.x, w03.y, w03.z, w03.w, src0.Load(a0 + 16) };
+        const float d    = f16tof32(odd ? (W[0] >> 16) : (W[0] & 0xFFFFu));
+        float       sum[MAX_COLS] = { 0, 0, 0, 0 };
+        [unroll] for (uint j = 0; j < 4; j++) {
+            const uint  q  = odd ? W[j + 1] : ((W[j] >> 16) | (W[j + 1] << 16));
+            const float l0 = (float) ( q        & 0xFu) - 8.0f, l1 = (float) ((q >>  8) & 0xFu) - 8.0f;
+            const float l2 = (float) ((q >> 16) & 0xFu) - 8.0f, l3 = (float) ((q >> 24) & 0xFu) - 8.0f;
+            const float h0 = (float) ((q >>  4) & 0xFu) - 8.0f, h1 = (float) ((q >> 12) & 0xFu) - 8.0f;
+            const float h2 = (float) ((q >> 20) & 0xFu) - 8.0f, h3 = (float) ( q >> 28        ) - 8.0f;
+            [unroll] for (uint c = 0; c < MAX_COLS; c++) {
+                if (c < ncols) {
+                    const uint   ys  = (src1_base[c] + blk * 32) * 4;
+                    const float4 ylo = asfloat(src1.Load4(ys + 16 * j));
+                    const float4 yhi = asfloat(src1.Load4(ys + 64 + 16 * j));
+                    sum[c] += l0 * ylo.x + l1 * ylo.y + l2 * ylo.z + l3 * ylo.w +
+                              h0 * yhi.x + h1 * yhi.y + h2 * yhi.z + h3 * yhi.w;
+                }
+            }
+        }
+        [unroll] for (uint c2 = 0; c2 < MAX_COLS; c2++) {
+            acc[c2] += sum[c2] * d;
+        }
+    }
 #elif defined(SRC0_Q4_0) && defined(ONE_COL) && !defined(SRC1_F16)
     // single column: the block as one 20-byte window (Load4 + Load) and src1 in Load4s. the generic path issues 41 scalar
     // load messages per block, this one 13 (DX11 exp146: FXC kept them apart, tg 3.4x on Intel).
@@ -72,6 +103,32 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
                    ((float) ((q >> 20) & 0xFu) - 8.0f) * yhi.z + ((float) ( q >> 28        ) - 8.0f) * yhi.w;
         }
         acc[0] += sum * d;
+    }
+#elif defined(SRC0_Q8_0) && defined(ONE_COL) && defined(MULTI_COL) && !defined(SRC1_F16)
+    // 2..MAX_COLS columns, see the Q4_0 variant above (exp360)
+    for (uint blk = lane; blk < k / 32; blk += TPR) {
+        const uint  base = (src0_base + blk) * 34;
+        const uint  a0   = base & ~3u;
+        const bool  odd  = (base & 2u) != 0;
+        const uint4 wa   = src0.Load4(a0);
+        const uint4 wb   = src0.Load4(a0 + 16);
+        const uint  W[9] = { wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w, src0.Load(a0 + 32) };
+        const float d    = f16tof32(odd ? (W[0] >> 16) : (W[0] & 0xFFFFu));
+        float       sum[MAX_COLS] = { 0, 0, 0, 0 };
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const uint  q  = odd ? W[j + 1] : ((W[j] >> 16) | (W[j + 1] << 16));
+            const float w0 = (float) sbyte_of(q, 0), w1 = (float) sbyte_of(q, 1);
+            const float w2 = (float) sbyte_of(q, 2), w3 = (float) sbyte_of(q, 3);
+            [unroll] for (uint c = 0; c < MAX_COLS; c++) {
+                if (c < ncols) {
+                    const float4 y = asfloat(src1.Load4((src1_base[c] + blk * 32) * 4 + 16 * j));
+                    sum[c] += w0 * y.x + w1 * y.y + w2 * y.z + w3 * y.w;
+                }
+            }
+        }
+        [unroll] for (uint c2 = 0; c2 < MAX_COLS; c2++) {
+            acc[c2] += sum[c2] * d;
+        }
     }
 #elif defined(SRC0_Q8_0) && defined(ONE_COL) && !defined(SRC1_F16)
     // single column: the 34-byte block as one 36-byte window (2x Load4 + Load) and src1 in Load4s
