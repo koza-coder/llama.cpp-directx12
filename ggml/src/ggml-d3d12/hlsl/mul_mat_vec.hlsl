@@ -162,7 +162,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint src02_idx = dst2_idx / broadcast2;
     const uint src03_idx = dst3_idx / broadcast3;
 
-#if defined(ONE_COL)
+#if defined(ONE_COL) && !defined(MULTI_COL)
     const uint ncols     = 1;
 #else
     const uint ncols     = min(MAX_COLS, n - col0);
