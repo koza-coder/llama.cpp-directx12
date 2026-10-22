@@ -20,6 +20,253 @@
 // expert and up to TILE_N of its (token, slot) pairs as the columns.
 // src0 offsets/strides are in elements for float types and in blocks for quant types.
 
+#if defined(BIG_TILE)
+#ifndef BT_AMODE
+#define BT_AMODE 0
+#endif
+#ifndef BT_BVEC
+#define BT_BVEC 0
+#endif
+// exp526: BT_AMODE 2 = one thread loads the whole 18-byte Q4_0 block as 5 aligned words (needs BT_ASPLIT=1); BT_BVEC 1 = float4 loads of the f32 columns
+// exp504: bigger register tile for the dense prompt path (Q4_0 / Q8_0, f32 or f16 columns, no MMID).
+// 128 x 64 tile of dst per workgroup, k in steps of 32, 256 threads; each thread owns 8 rows x 4 columns
+// (32 accumulators, 12 groupshared reads per 32 FMA instead of 6 per 8). All 256 threads dequantize
+// (two threads per src0 row, one 16-element half of the 32-element block each), the old kernel used 64.
+// Rows of a thread are interleaved (ty + 16 * i) so a wave reads 16 consecutive groupshared words and
+// writes 16 consecutive dst rows.
+// BT_TM x BT_TN tile, BT_RM x BT_RN values per thread, (BT_TM / BT_RM) * (BT_TN / BT_RN) = 256 threads
+#define TILE_M BT_TM
+#define TILE_N BT_TN
+#define TILE_K 32
+#define NTHREADS 256
+#define REG_M BT_RM
+#define REG_N BT_RN
+#define TH_Y (TILE_M / REG_M)
+#define TH_X (TILE_N / REG_N)
+#if defined(BT_ASPLIT)
+#define A_SPLIT BT_ASPLIT               // threads per src0 row in the staging (threads beyond TILE_M * A_SPLIT stay idle there)
+#else
+#define A_SPLIT (NTHREADS / TILE_M)     // threads per src0 row in the staging
+#endif
+#define A_ELEMS (32 / A_SPLIT)          // block elements per staging thread
+#define B_PARTS (NTHREADS / TILE_N)     // threads per src1 column in the staging
+#define B_ELEMS (32 / B_PARTS)
+
+RWByteAddressBuffer src1 : register(u0);
+RWByteAddressBuffer src0 : register(u1);
+RWByteAddressBuffer dst  : register(u2);
+
+cbuffer Params : register(b0) {
+    uint offset_src0;
+    uint offset_src1;
+    uint offset_dst;
+    uint m;
+    uint n;
+    uint k;
+    uint stride_01;
+    uint stride_02;
+    uint stride_03;
+    uint stride_11;
+    uint stride_12;
+    uint stride_13;
+    uint ne2;
+    uint broadcast2;
+    uint broadcast3;
+    uint n_batches;
+    uint nwg_x;
+};
+
+groupshared float Atile[TILE_K][TILE_M];
+groupshared float Btile[TILE_K][TILE_N];
+
+[numthreads(NTHREADS, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    const uint tid       = gtid.x;
+#if BT_LAYOUT == 1
+    // each thread owns consecutive rows and columns (the layout of the 64 x 32 kernel)
+    const uint tx        = tid % TH_X;
+    const uint ty        = tid / TH_X;
+#define BT_ROW(i) (ty * REG_M + (i))
+#define BT_COL(j) (tx * REG_N + (j))
+#else
+    const uint ty        = tid % TH_Y;   // row group: rows ty + TH_Y * i
+    const uint tx        = tid / TH_Y;   // column group: columns tx + TH_X * j
+#define BT_ROW(i) (ty + TH_Y * (i))
+#define BT_COL(j) (tx + TH_X * (j))
+#endif
+    const uint wg_linear = gid.y * nwg_x + gid.x;
+
+    const uint tiles_m = (m + TILE_M - 1) / TILE_M;
+    const uint tiles_n = (n + TILE_N - 1) / TILE_N;
+    const uint tile_id = wg_linear % (tiles_m * tiles_n);
+    const uint batch   = wg_linear / (tiles_m * tiles_n);
+    if (batch >= n_batches) {
+        return;
+    }
+    const uint dst2_idx  = batch % ne2;
+    const uint dst3_idx  = batch / ne2;
+    const uint src02_idx = dst2_idx / broadcast2;
+    const uint src03_idx = dst3_idx / broadcast3;
+
+    const uint row0 = (tile_id % tiles_m) * TILE_M;
+    const uint col0 = (tile_id / tiles_m) * TILE_N;
+
+    const uint a_batch = offset_src0 + src03_idx * stride_03 + src02_idx * stride_02;
+    const uint b_batch = offset_src1 + dst3_idx * stride_13 + dst2_idx * stride_12;
+
+    // staging roles
+    const uint a_row  = tid % TILE_M;
+    const uint a_part = tid / TILE_M;          // elements a_part * A_ELEMS .. + A_ELEMS - 1 of the block
+    const uint a_r    = row0 + a_row;
+    const uint b_col  = tid / B_PARTS;         // the B_PARTS threads of one column are neighbours: contiguous src1 reads
+    const uint b_part = tid % B_PARTS;         // k range b_part * B_ELEMS .. + B_ELEMS - 1
+    const bool b_ok   = col0 + b_col < n;
+    const uint b_base = b_batch + (col0 + b_col) * stride_11;
+
+    float acc[REG_M][REG_N];
+    [unroll] for (uint im = 0; im < REG_M; im++) {
+        [unroll] for (uint jn = 0; jn < REG_N; jn++) {
+            acc[im][jn] = 0.0f;
+        }
+    }
+
+    for (uint kt = 0; kt < k; kt += TILE_K) {
+        if (a_part < A_SPLIT) {
+        float vals[A_ELEMS];
+        if (a_r < m) {
+#if defined(SRC0_Q4_0)
+            // block: f16 d, 16 bytes of nibbles; low nibbles are elements 0..15, high nibbles 16..31
+            const uint base = (a_batch + a_r * stride_01 + kt / 32) * 18;
+#if BT_AMODE >= 2 && A_ELEMS == 32
+            uint w[5];
+            const uint a0 = base & ~3u;
+            [unroll] for (uint z = 0; z < 5; z++) {
+                w[z] = src0.Load(a0 + 4 * z);
+            }
+            if ((base & 2u) != 0u) {
+                [unroll] for (uint z2 = 0; z2 < 4; z2++) {
+                    w[z2] = (w[z2] >> 16) | (w[z2 + 1] << 16);
+                }
+                w[4] = w[4] >> 16;
+            }
+            const float d = f16tof32(w[0] & 0xFFFFu);
+            [unroll] for (uint j = 0; j < 4; j++) {
+                const uint q = (w[j] >> 16) | (w[j + 1] << 16);
+                [unroll] for (uint b = 0; b < 4; b++) {
+                    const uint byte = byte_of(q, b);
+                    vals[j * 4 + b]      = ((float) (byte & 0xFu) - 8.0f) * d;
+                    vals[16 + j * 4 + b] = ((float) (byte >> 4) - 8.0f) * d;
+                }
+            }
+#else
+            uint dbits;
+            LOAD_U16_UNALIGNED(src0, base, dbits);
+            const float d = f16tof32(dbits);
+#if A_ELEMS == 32
+            [unroll] for (uint j = 0; j < 4; j++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, base + 2 + 4 * j, q);
+                [unroll] for (uint b = 0; b < 4; b++) {
+                    const uint byte = byte_of(q, b);
+                    vals[j * 4 + b]      = ((float) (byte & 0xFu) - 8.0f) * d;
+                    vals[16 + j * 4 + b] = ((float) (byte >> 4) - 8.0f) * d;
+                }
+            }
+#else
+            const uint e0     = a_part * A_ELEMS;       // first element of this thread
+            const bool high   = e0 >= 16;
+            const uint byte0  = e0 % 16;
+            [unroll] for (uint j = 0; j < A_ELEMS / 4; j++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, base + 2 + byte0 + 4 * j, q);
+                [unroll] for (uint b = 0; b < 4; b++) {
+                    const uint byte = byte_of(q, b);
+                    vals[j * 4 + b] = ((float) (high ? (byte >> 4) : (byte & 0xFu)) - 8.0f) * d;
+                }
+            }
+#endif
+#endif
+#else
+            // Q8_0 block: f16 d, 32 int8
+            const uint base = (a_batch + a_r * stride_01 + kt / 32) * 34;
+            uint dbits;
+            LOAD_U16_UNALIGNED(src0, base, dbits);
+            const float d = f16tof32(dbits);
+            [unroll] for (uint j = 0; j < A_ELEMS / 4; j++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, base + 2 + a_part * A_ELEMS + 4 * j, q);
+                [unroll] for (uint b = 0; b < 4; b++) {
+                    vals[j * 4 + b] = (float) sbyte_of(q, b) * d;
+                }
+            }
+#endif
+        } else {
+            [unroll] for (uint z = 0; z < A_ELEMS; z++) {
+                vals[z] = 0.0f;
+            }
+        }
+        [unroll] for (uint ki = 0; ki < A_ELEMS; ki++) {
+            Atile[a_part * A_ELEMS + ki][a_row] = vals[ki];
+        }
+        }
+#if BT_BVEC && !defined(SRC1_F16)
+        [unroll] for (uint i4 = 0; i4 < B_ELEMS / 4; i4++) {
+            const uint ki0 = b_part * B_ELEMS + 4 * i4;
+            float4 bv = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (b_ok) {
+                bv = asfloat(src1.Load4((b_base + kt + ki0) * 4));
+            }
+            Btile[ki0][b_col] = bv.x;
+            Btile[ki0 + 1][b_col] = bv.y;
+            Btile[ki0 + 2][b_col] = bv.z;
+            Btile[ki0 + 3][b_col] = bv.w;
+        }
+#else
+        [unroll] for (uint i = 0; i < B_ELEMS; i++) {
+            const uint ki = b_part * B_ELEMS + i;
+#if defined(SRC1_F16)
+            uint bits;
+            LOAD_U16_UNALIGNED(src1, (b_base + kt + ki) * 2, bits);
+            Btile[ki][b_col] = b_ok ? f16tof32(bits) : 0.0f;
+#else
+            Btile[ki][b_col] = b_ok ? LOAD_F32(src1, b_base + kt + ki) : 0.0f;
+#endif
+        }
+#endif
+        GroupMemoryBarrierWithGroupSync();
+
+        [unroll] for (uint kk = 0; kk < TILE_K; kk++) {
+            float a[REG_M], b[REG_N];
+            [unroll] for (uint im2 = 0; im2 < REG_M; im2++) {
+                a[im2] = Atile[kk][BT_ROW(im2)];
+            }
+            [unroll] for (uint in2 = 0; in2 < REG_N; in2++) {
+                b[in2] = Btile[kk][BT_COL(in2)];
+            }
+            [unroll] for (uint im3 = 0; im3 < REG_M; im3++) {
+                [unroll] for (uint in3 = 0; in3 < REG_N; in3++) {
+                    acc[im3][in3] += a[im3] * b[in3];
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    const uint dst_base = offset_dst + dst3_idx * (m * n * ne2) + dst2_idx * (m * n);
+    [unroll] for (uint jn4 = 0; jn4 < REG_N; jn4++) {
+        const uint c = col0 + BT_COL(jn4);
+        if (c >= n) {
+            continue;
+        }
+        [unroll] for (uint im4 = 0; im4 < REG_M; im4++) {
+            const uint r = row0 + BT_ROW(im4);
+            if (r < m) {
+                STORE_F32(dst, dst_base + c * m + r, acc[im4][jn4]);
+            }
+        }
+    }
+}
+#else
 #define TILE_M 64
 #define TILE_N 32
 #define TILE_K 32
@@ -360,3 +607,4 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
     }
 }
+#endif   // BIG_TILE

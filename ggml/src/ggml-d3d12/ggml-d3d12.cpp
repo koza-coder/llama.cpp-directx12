@@ -57,6 +57,26 @@
 #ifndef GGML_D3D12_MV_MULTI_DEFAULT
 #define GGML_D3D12_MV_MULTI_DEFAULT 1
 #endif
+// exp529: defaults of the exp528 matmul (exp526 variant v3)
+#define GGML_D3D12_BT_TM 64
+#define GGML_D3D12_BT_TN 32
+#define GGML_D3D12_BT_RM 4
+#define GGML_D3D12_BT_RN 2
+#define GGML_D3D12_BT_LAYOUT 1
+#define GGML_D3D12_BT_ASPLIT 1
+#define GGML_D3D12_BT_AMODE 2
+#define GGML_D3D12_BT_BVEC 1
+// exp504: bigger register tile for the dense Q4_0 / Q8_0 prompt matmul (0 = old 64 x 32 tile)
+#ifndef GGML_D3D12_BIGTILE
+#define GGML_D3D12_BIGTILE 1
+#endif
+// tile shape of the BIG_TILE kernel: BT_TM x BT_TN per workgroup, BT_RM x BT_RN per thread (256 threads)
+#ifndef GGML_D3D12_BT_TM
+#define GGML_D3D12_BT_TM 128
+#define GGML_D3D12_BT_TN 64
+#define GGML_D3D12_BT_RM 8
+#define GGML_D3D12_BT_RN 4
+#endif
 #ifndef GGML_D3D12_TILED_DEFAULT
 #define GGML_D3D12_TILED_DEFAULT    16
 #endif
@@ -1572,6 +1592,31 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
     }
+    // exp504: 128 x 64 tile with 8 x 4 values per thread for Q4_0 / Q8_0 from 64 columns
+    static const char * bt_env = getenv("GGML_D3D12_BIGTILE");
+    const bool bt_on = bt_env ? atoi(bt_env) != 0 : (GGML_D3D12_BIGTILE != 0 && dev.vendor_id == 0x1ED5);
+    const bool big = bt_on && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && dst->ne[1] >= (uint32_t) GGML_D3D12_BT_TN;
+    if (big) {
+        defines.push_back("BIG_TILE");
+        defines.push_back("BT_TM=" + std::to_string(GGML_D3D12_BT_TM));
+        defines.push_back("BT_TN=" + std::to_string(GGML_D3D12_BT_TN));
+        defines.push_back("BT_RM=" + std::to_string(GGML_D3D12_BT_RM));
+        defines.push_back("BT_RN=" + std::to_string(GGML_D3D12_BT_RN));
+#ifdef GGML_D3D12_BT_LAYOUT
+        defines.push_back("BT_LAYOUT=" + std::to_string(GGML_D3D12_BT_LAYOUT));
+#else
+        defines.push_back("BT_LAYOUT=0");
+#endif
+#ifdef GGML_D3D12_BT_ASPLIT
+        defines.push_back("BT_ASPLIT=" + std::to_string(GGML_D3D12_BT_ASPLIT));
+#endif
+#ifdef GGML_D3D12_BT_AMODE
+        defines.push_back("BT_AMODE=" + std::to_string(GGML_D3D12_BT_AMODE));
+#endif
+#ifdef GGML_D3D12_BT_BVEC
+        defines.push_back("BT_BVEC=" + std::to_string(GGML_D3D12_BT_BVEC));
+#endif
+    }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines);
 
     const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
@@ -1593,8 +1638,8 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     };
 
     // tile sizes must match TILE_M and TILE_N in mul_mat_tiled.hlsl
-    const uint32_t tiles_m  = CEIL_DIV((uint32_t) dst->ne[0], 64u);
-    const uint32_t tiles_n  = CEIL_DIV((uint32_t) dst->ne[1], 32u);
+    const uint32_t tiles_m  = CEIL_DIV((uint32_t) dst->ne[0], big ? (uint32_t) GGML_D3D12_BT_TM : 64u);
+    const uint32_t tiles_n  = CEIL_DIV((uint32_t) dst->ne[1], big ? (uint32_t) GGML_D3D12_BT_TN : 32u);
     const uint32_t batches  = (uint32_t) (dst->ne[2] * dst->ne[3]);
     ggml_d3d12_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va }, tiles_m * tiles_n * batches);
 }
@@ -3473,7 +3518,12 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
         defines.push_back("V_ALIGNED");
     }
     // one query row (decode): a workgroup per (row, KV block) instead of a thread
-    const bool     decode = q->ne[1] == 1 && !dev.no_fuse;
+    // exp509/exp510: on the Moore Threads S80 the prompt kernel (pass 1) took 26 ms per call (the registers of q and acc
+    // spill at head size 256/512); the workgroup-per-(row, block) kernel takes 1.5 ms. GGML_D3D12_FA_PROMPT_DECODE=0/1
+    // overrides the vendor default (1 on Moore Threads, 0 elsewhere).
+    static const char * fa_env = getenv("GGML_D3D12_FA_PROMPT_DECODE");
+    const bool     prompt_decode = fa_env ? atoi(fa_env) != 0 : dev.vendor_id == 0x1ED5;
+    const bool     decode = (q->ne[1] == 1 || prompt_decode) && !dev.no_fuse;
     const uint32_t blk    = decode ? D3D12_WG_SIZE : D3D12_FLASH_ATTN_BLK;
     if (decode) {
         defines.push_back("DECODE");
@@ -4359,6 +4409,22 @@ static ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend, stru
     std::lock_guard<std::recursive_mutex> lock(dev.mutex);
     const double t0 = ggml_d3d12_time_us();
     const double submit0 = dev.t_submit_us, wait0 = dev.t_wait_us;
+    // exp515-519/523: on the Moore Threads S80 a prompt graph is 30-40 % slower when a command list holds more than 32 dispatches
+    // (pp512 43.4 t/s up to 32, 26-37 above); decode keeps the default because every extra submit costs ~0.11 ms per token.
+    // GGML_D3D12_SUBMIT_BATCH overrides.
+    {
+        static const bool user_batch = getenv("GGML_D3D12_SUBMIT_BATCH") != nullptr;
+        if (dev.vendor_id == 0x1ED5 && !user_batch) {
+            uint32_t n_cols = 1;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+                    n_cols = (uint32_t) cgraph->nodes[i]->src[1]->ne[1];
+                    break;
+                }
+            }
+            dev.submit_batch = n_cols > 1 ? 16 : D3D12_DEFAULT_SUBMIT_BATCH;
+        }
+    }
     dev.spec_valid = false;   // exp411: a copy of the last graph's output is stale from here on
     ggml_d3d12_begin(dev, true);
     dev.touched.clear();
