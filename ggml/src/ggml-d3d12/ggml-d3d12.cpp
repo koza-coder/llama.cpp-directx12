@@ -213,6 +213,29 @@ struct d3d12_device_ctx {
     // staging for set/get tensor
     com_ptr<ID3D12Resource> upload_buf;
     void *                  upload_ptr = nullptr;
+    // exp408: small set_tensor calls (graph inputs) are queued on their own list and executed without a CPU wait
+    com_ptr<ID3D12Resource>            small_buf;                 // UPLOAD heap ring, persistently mapped
+    uint8_t *                          small_ptr   = nullptr;
+    size_t                             small_off   = 0;
+    com_ptr<ID3D12CommandAllocator>    small_alloc;
+    com_ptr<ID3D12GraphicsCommandList> small_list;
+    bool                               small_open  = false;       // small_list is recording
+    uint64_t                           small_fence = 0;           // fence value after the last executed small list
+    // exp411: tail readback (copy of the last graph node, executed behind the graph list, read by the next get_tensor)
+    com_ptr<ID3D12CommandAllocator>    tail_alloc;
+    com_ptr<ID3D12GraphicsCommandList> tail_list;
+    ID3D12Resource *                   tail_res    = nullptr;     // set by graph_compute for this submit only
+    size_t                             tail_off    = 0;
+    size_t                             tail_size   = 0;
+    ID3D12Resource *                   want_res    = nullptr;     // learned: what the last get_tensor asked for
+    size_t                             want_off    = 0;
+    size_t                             want_size   = 0;
+    ID3D12Resource *                   spec_res    = nullptr;     // what readback_buf holds right now
+    size_t                             spec_off    = 0;
+    size_t                             spec_size   = 0;
+    bool                               spec_valid  = false;
+    uint64_t                           n_tail      = 0;           // tail copies made
+    uint64_t                           n_tail_hit  = 0;           // get_tensor calls served from one
     com_ptr<ID3D12Resource> readback_buf;
 
     // flash attention block results, grown on demand
@@ -377,9 +400,34 @@ static com_ptr<ID3D12Resource> ggml_d3d12_create_buffer(d3d12_device_ctx & dev,
     return res;
 }
 
+#define D3D12_SMALL_RING  (4ull << 20)    // exp408: ring for small uploads
+#define D3D12_SMALL_MAX   (256u << 10)    // exp408: largest set_tensor that is queued instead of waited for
+
+static void ggml_d3d12_wait_value(d3d12_device_ctx & dev, uint64_t v) {
+    if (dev.fence->GetCompletedValue() < v) {
+        ggml_d3d12_check(dev.fence->SetEventOnCompletion(v, dev.fence_event), "ID3D12Fence::SetEventOnCompletion");
+        WaitForSingleObject(dev.fence_event, INFINITE);
+    }
+}
+
+// exp408: execute the queued small uploads without waiting; the queue runs lists in order, so everything submitted
+// afterwards sees the data
+static void ggml_d3d12_small_flush(d3d12_device_ctx & dev) {
+    if (!dev.small_open) {
+        return;
+    }
+    ggml_d3d12_check(dev.small_list->Close(), "ID3D12GraphicsCommandList::Close (small)");
+    ID3D12CommandList * lists[] = { dev.small_list.get() };
+    dev.queue->ExecuteCommandLists(1, lists);
+    dev.small_fence = ++dev.fence_value;
+    ggml_d3d12_check(dev.queue->Signal(dev.fence.get(), dev.small_fence), "ID3D12CommandQueue::Signal (small)");
+    dev.small_open = false;
+}
+
 // begin recording on the (single) command list; the previous submission has always completed
 static void ggml_d3d12_begin(d3d12_device_ctx & dev, bool compute) {
     GGML_ASSERT(!dev.recording);
+    ggml_d3d12_small_flush(dev);
     ggml_d3d12_check(dev.allocator->Reset(), "ID3D12CommandAllocator::Reset");
     ggml_d3d12_check(dev.cmd_list->Reset(dev.allocator.get(), nullptr), "ID3D12GraphicsCommandList::Reset");
     if (compute) {
@@ -452,6 +500,37 @@ static void ggml_d3d12_report_dred(d3d12_device_ctx & dev) {
     }
 }
 
+// exp411: execute the tail copy of the graph's last node right behind the graph list; returns the fence value to wait for
+static uint64_t ggml_d3d12_tail_copy(d3d12_device_ctx & dev) {
+    if (!dev.readback_buf) {
+        dev.readback_buf = ggml_d3d12_create_buffer(dev, D3D12_STAGING_SIZE, D3D12_HEAP_TYPE_READBACK, L"ggml_d3d12_readback");
+        GGML_ASSERT(dev.readback_buf);
+    }
+    if (!dev.tail_list) {
+        ggml_d3d12_check(dev.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(dev.tail_alloc.put())),
+                         "CreateCommandAllocator (tail)");
+        ggml_d3d12_check(dev.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, dev.tail_alloc.get(), nullptr,
+                                                       IID_PPV_ARGS(dev.tail_list.put())), "CreateCommandList (tail)");
+    } else {
+        // the previous tail list finished: every submit_and_wait waits for the value of its own tail list
+        ggml_d3d12_check(dev.tail_alloc->Reset(), "ID3D12CommandAllocator::Reset (tail)");
+        ggml_d3d12_check(dev.tail_list->Reset(dev.tail_alloc.get(), nullptr), "ID3D12GraphicsCommandList::Reset (tail)");
+    }
+    dev.tail_list->CopyBufferRegion(dev.readback_buf.get(), 0, dev.tail_res, dev.tail_off, dev.tail_size);
+    ggml_d3d12_check(dev.tail_list->Close(), "ID3D12GraphicsCommandList::Close (tail)");
+    ID3D12CommandList * lists[] = { dev.tail_list.get() };
+    dev.queue->ExecuteCommandLists(1, lists);
+    const uint64_t v = ++dev.fence_value;
+    ggml_d3d12_check(dev.queue->Signal(dev.fence.get(), v), "ID3D12CommandQueue::Signal (tail)");
+    dev.spec_res   = dev.tail_res;
+    dev.spec_off   = dev.tail_off;
+    dev.spec_size  = dev.tail_size;
+    dev.spec_valid = true;
+    dev.tail_res   = nullptr;
+    dev.n_tail++;
+    return v;
+}
+
 static void ggml_d3d12_submit_and_wait(d3d12_device_ctx & dev) {
     GGML_ASSERT(dev.recording);
     if (dev.query_count > 0) {
@@ -462,8 +541,11 @@ static void ggml_d3d12_submit_and_wait(d3d12_device_ctx & dev) {
     ggml_d3d12_check(dev.cmd_list->Close(), "ID3D12GraphicsCommandList::Close");
     ID3D12CommandList * lists[] = { dev.cmd_list.get() };
     dev.queue->ExecuteCommandLists(1, lists);
-    const uint64_t v = ++dev.fence_value;
+    uint64_t v = ++dev.fence_value;
     ggml_d3d12_check(dev.queue->Signal(dev.fence.get(), v), "ID3D12CommandQueue::Signal");
+    if (dev.tail_res != nullptr) {
+        v = ggml_d3d12_tail_copy(dev);   // exp411: the one wait below covers the graph list and its tail copy
+    }
     const double t0 = ggml_d3d12_time_us();
     dev.t_submit_us += t0 - ts;
     if (dev.fence->GetCompletedValue() < v) {
@@ -1116,6 +1198,7 @@ static void ggml_d3d12_buffer_memset(d3d12_device_ctx & dev, D3D12_GPU_VIRTUAL_A
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(dev.mutex);
+    dev.spec_valid = false;   // exp411
     const uint32_t val32 = (uint32_t) value * 0x01010101u;
 
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "memset", hlsl_memset,
@@ -4266,6 +4349,8 @@ static void ggml_backend_d3d12_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static void ggml_backend_d3d12_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size);
+
 static ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto *             ctx = (ggml_backend_d3d12_context *) backend->context;
     d3d12_device_ctx & dev = *ctx->dev;
@@ -4274,6 +4359,7 @@ static ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend, stru
     std::lock_guard<std::recursive_mutex> lock(dev.mutex);
     const double t0 = ggml_d3d12_time_us();
     const double submit0 = dev.t_submit_us, wait0 = dev.t_wait_us;
+    dev.spec_valid = false;   // exp411: a copy of the last graph's output is stale from here on
     ggml_d3d12_begin(dev, true);
     dev.touched.clear();
     dev.group_first = 0;
@@ -4289,6 +4375,21 @@ static ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend, stru
     dev.last_graph_nodes = cgraph->n_nodes;
     for (int i = 0; i < cgraph->n_nodes;) {
         i += ggml_d3d12_encode_nodes(dev, cgraph, i);
+    }
+    // exp411: when the last node holds what the host read last time, copy it behind this list (one wait for both)
+    static const bool no_tail = getenv("GGML_D3D12_NO_TAIL_READBACK") != nullptr;
+    if (!no_tail && dev.want_res != nullptr && cgraph->n_nodes > 0) {
+        const ggml_tensor *   last = cgraph->nodes[cgraph->n_nodes - 1];
+        ggml_backend_buffer_t buf  = last->view_src ? last->view_src->buffer : last->buffer;
+        if (buf != nullptr && buf->iface.get_tensor == ggml_backend_d3d12_buffer_get_tensor) {
+            auto *       bctx = (ggml_backend_d3d12_buffer_context *) buf->context;
+            const size_t off  = ggml_d3d12_tensor_offset(last);
+            if (bctx->res.get() == dev.want_res && dev.want_off >= off && dev.want_off + dev.want_size <= off + ggml_nbytes(last)) {
+                dev.tail_res  = dev.want_res;
+                dev.tail_off  = dev.want_off;
+                dev.tail_size = dev.want_size;
+            }
+        }
     }
     ggml_d3d12_submit_and_wait(dev);
     dev.n_graphs++;
@@ -4331,6 +4432,10 @@ static void ggml_backend_d3d12_buffer_free_buffer(ggml_backend_buffer_t buffer) 
     if (ctx->dev && ctx->dev->uav_table && ctx->va) {
         ctx->dev->va_map.erase(ctx->va);
     }
+    if (ctx->dev) {
+        ctx->dev->spec_valid = false;   // exp411
+        ctx->dev->want_res   = nullptr;
+    }
     delete ctx;
 }
 
@@ -4351,6 +4456,47 @@ static void ggml_backend_d3d12_buffer_set_tensor(ggml_backend_buffer_t buffer, g
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(dev.mutex);
+    dev.spec_valid = false;   // exp411
+
+    // exp408: a small upload (graph input) is copied into the ring and queued, no submit and no CPU wait of its own
+    static const bool no_small = getenv("GGML_D3D12_NO_SMALL_UPLOAD") != nullptr;
+    if (!no_small && size <= D3D12_SMALL_MAX && !dev.recording) {
+        const double t0s = ggml_d3d12_time_us();
+        if (!dev.small_buf) {
+            dev.small_buf = ggml_d3d12_create_buffer(dev, D3D12_SMALL_RING, D3D12_HEAP_TYPE_UPLOAD, L"ggml_d3d12_small_upload");
+            GGML_ASSERT(dev.small_buf);
+            D3D12_RANGE no_read = { 0, 0 };
+            void *      p       = nullptr;
+            ggml_d3d12_check(dev.small_buf->Map(0, &no_read, &p), "ID3D12Resource::Map (small upload)");
+            dev.small_ptr = (uint8_t *) p;
+            ggml_d3d12_check(dev.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(dev.small_alloc.put())),
+                             "CreateCommandAllocator (small)");
+            ggml_d3d12_check(dev.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, dev.small_alloc.get(), nullptr,
+                                                           IID_PPV_ARGS(dev.small_list.put())), "CreateCommandList (small)");
+            dev.small_list->Close();
+        }
+        const size_t need = (size + 255) & ~(size_t) 255;
+        if (dev.small_off + need > D3D12_SMALL_RING) {
+            // ring full: execute what is queued and wait until the GPU has read all of it
+            ggml_d3d12_small_flush(dev);
+            ggml_d3d12_wait_value(dev, dev.small_fence);
+            dev.small_off = 0;
+        }
+        if (!dev.small_open) {
+            // the allocator may be reset only after the previous small list ran
+            ggml_d3d12_wait_value(dev, dev.small_fence);
+            ggml_d3d12_check(dev.small_alloc->Reset(), "ID3D12CommandAllocator::Reset (small)");
+            ggml_d3d12_check(dev.small_list->Reset(dev.small_alloc.get(), nullptr), "ID3D12GraphicsCommandList::Reset (small)");
+            dev.small_open = true;
+        }
+        memcpy(dev.small_ptr + dev.small_off, data, size);
+        dev.small_list->CopyBufferRegion(ctx->res.get(), ggml_d3d12_tensor_offset(tensor) + offset, dev.small_buf.get(), dev.small_off, size);
+        dev.small_off += need;
+        dev.n_set_tensor++;
+        dev.bytes_set += size;
+        dev.t_set_us += ggml_d3d12_time_us() - t0s;
+        return;
+    }
 
     if (!dev.upload_buf) {
         dev.upload_buf = ggml_d3d12_create_buffer(dev, D3D12_STAGING_SIZE, D3D12_HEAP_TYPE_UPLOAD, L"ggml_d3d12_upload");
@@ -4390,6 +4536,29 @@ static void ggml_backend_d3d12_buffer_get_tensor(ggml_backend_buffer_t buffer, c
 
     const double t0         = ggml_d3d12_time_us();
     const size_t src_offset = ggml_d3d12_tensor_offset(tensor) + offset;
+    if (dev.spec_valid && ctx->res.get() == dev.spec_res && src_offset >= dev.spec_off &&
+        src_offset + size <= dev.spec_off + dev.spec_size) {
+        // exp411: this region was copied behind the graph list already
+        const size_t rel   = src_offset - dev.spec_off;
+        void *       ptr   = nullptr;
+        D3D12_RANGE  range = { rel, rel + size };
+        ggml_d3d12_check(dev.readback_buf->Map(0, &range, &ptr), "ID3D12Resource::Map (readback, tail)");
+        memcpy(data, (const char *) ptr + rel, size);
+        D3D12_RANGE no_write = { 0, 0 };
+        dev.readback_buf->Unmap(0, &no_write);
+        dev.n_get_tensor++;
+        dev.n_tail_hit++;
+        dev.bytes_get += size;
+        dev.t_get_us += ggml_d3d12_time_us() - t0;
+        return;
+    }
+    // miss: the readback below overwrites readback_buf, and the next graphs copy this region behind their list
+    dev.spec_valid = false;
+    if (size <= (size_t) (16u << 20)) {
+        dev.want_res  = ctx->res.get();
+        dev.want_off  = src_offset;
+        dev.want_size = size;
+    }
     size_t       done       = 0;
     while (done < size) {
         const size_t n = std::min(size - done, (size_t) D3D12_STAGING_SIZE);
