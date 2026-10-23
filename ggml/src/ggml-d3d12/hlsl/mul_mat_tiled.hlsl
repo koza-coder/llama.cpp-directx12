@@ -21,6 +21,371 @@
 // src0 offsets/strides are in elements for float types and in blocks for quant types.
 
 #if defined(BIG_TILE)
+#if defined(BT_DP4A)
+// exp617/exp622: integer-dot variant of the BIG_TILE kernel. Weights stay quantized (Q4_0 nibbles - 8, or Q8_0 bytes) and are packed 4 per word;
+// the f32 columns are quantized to int8 per 32-block (Q8_0 style, scale = amax / 127) while they are staged; the 32-element block product is
+// 8 dot4add_i8packed per output and one scale multiply-add. Needs SM 6.4. Tile 128 x 64 (8 x 4 per thread) or 64 x 32 (4 x 2).
+#if defined(SRC0_Q4_K)
+#define A_MODE 1        // value = dl * q - ml (q 0..15): sum = dl * isum - ml * (sum of the int8 column values)
+#elif defined(SRC0_Q6_K)
+#define A_MODE 2        // value = d * sc * (q - 32), one scale per 16 values: sum = sc0 * isum(0..15) + sc1 * isum(16..31)
+#else
+#define A_MODE 0        // Q4_0 / Q8_0: value = d * q
+#endif
+#define TILE_M BT_TM
+#define TILE_N BT_TN
+#define TILE_K 32
+#define NTHREADS 256
+#define REG_M BT_RM
+#define REG_N BT_RN
+#define TH_Y (TILE_M / REG_M)
+#define TH_X (TILE_N / REG_N)
+#define A_SPLIT (NTHREADS / TILE_M)     // threads per src0 row in the staging
+#define A_ELEMS (32 / A_SPLIT)          // block elements per staging thread
+#define A_WORDS (A_ELEMS / 4)
+#define B_PARTS (NTHREADS / TILE_N)     // threads per src1 column in the staging
+#define B_ELEMS (32 / B_PARTS)
+#define B_WORDS (B_ELEMS / 4)
+#if A_MODE != 0 && A_SPLIT != 2
+#error "K-quant DP4a staging needs two threads per row (TILE_M 128)"
+#endif
+
+RWByteAddressBuffer src1 : register(u0);
+RWByteAddressBuffer src0 : register(u1);
+RWByteAddressBuffer dst  : register(u2);
+
+cbuffer Params : register(b0) {
+    uint offset_src0;
+    uint offset_src1;
+    uint offset_dst;
+    uint m;
+    uint n;
+    uint k;
+    uint stride_01;
+    uint stride_02;
+    uint stride_03;
+    uint stride_11;
+    uint stride_12;
+    uint stride_13;
+    uint ne2;
+    uint broadcast2;
+    uint broadcast3;
+    uint n_batches;
+    uint nwg_x;
+};
+
+groupshared uint  Aq[8][TILE_M];
+groupshared float Ad[TILE_M];
+groupshared float Am[TILE_M];   // Q4_K: ml, Q6_K: second scale
+groupshared uint  Bq[8][TILE_N];
+groupshared float Bd[TILE_N];
+groupshared float Bmx[TILE_N][B_PARTS];
+groupshared float Bsm[TILE_N][B_PARTS];   // per part: sum of the quantized column values
+groupshared float Bs[TILE_N];
+
+[numthreads(NTHREADS, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    const uint tid       = gtid.x;
+    const uint ty        = tid % TH_Y;   // row group: rows ty + TH_Y * i
+    const uint tx        = tid / TH_Y;   // column group: columns tx + TH_X * j
+#define BT_ROW(i) (ty + TH_Y * (i))
+#define BT_COL(j) (tx + TH_X * (j))
+    const uint wg_linear = gid.y * nwg_x + gid.x;
+
+    const uint tiles_m = (m + TILE_M - 1) / TILE_M;
+    const uint tiles_n = (n + TILE_N - 1) / TILE_N;
+    const uint tile_id = wg_linear % (tiles_m * tiles_n);
+    const uint batch   = wg_linear / (tiles_m * tiles_n);
+    if (batch >= n_batches) {
+        return;
+    }
+    const uint dst2_idx  = batch % ne2;
+    const uint dst3_idx  = batch / ne2;
+    const uint src02_idx = dst2_idx / broadcast2;
+    const uint src03_idx = dst3_idx / broadcast3;
+
+    const uint row0 = (tile_id % tiles_m) * TILE_M;
+    const uint col0 = (tile_id / tiles_m) * TILE_N;
+
+    const uint a_batch = offset_src0 + src03_idx * stride_03 + src02_idx * stride_02;
+    const uint b_batch = offset_src1 + dst3_idx * stride_13 + dst2_idx * stride_12;
+
+    const uint a_row  = tid % TILE_M;
+    const uint a_part = tid / TILE_M;          // elements a_part * A_ELEMS .. + A_ELEMS - 1 of the block
+    const uint a_r    = row0 + a_row;
+    const uint b_col  = tid / B_PARTS;
+    const uint b_part = tid % B_PARTS;         // k range b_part * B_ELEMS .. + B_ELEMS - 1
+    const bool b_ok   = col0 + b_col < n;
+    const uint b_base = b_batch + (col0 + b_col) * stride_11;
+
+    float acc[REG_M][REG_N];
+    [unroll] for (uint im = 0; im < REG_M; im++) {
+        [unroll] for (uint jn = 0; jn < REG_N; jn++) {
+            acc[im][jn] = 0.0f;
+        }
+    }
+
+    for (uint kt = 0; kt < k; kt += TILE_K) {
+        if (a_part < A_SPLIT) {
+            uint  aw[A_WORDS];
+            float ad = 0.0f;
+            float am = 0.0f;
+            [unroll] for (uint z = 0; z < A_WORDS; z++) {
+                aw[z] = 0u;
+            }
+            if (a_r < m) {
+#if defined(SRC0_Q4_K)
+                // super-block of 256: f16 d, f16 dmin, 12 bytes of 6-bit scales/mins, 128 bytes of nibbles (see the fp32 loader)
+                const uint blk  = kt / 256;
+                const uint s    = (kt % 256) / 32;
+                const uint base = (a_batch + a_r * stride_01 + blk) * 144;
+                uint w;
+                LOAD_U32_UNALIGNED(src0, base, w);
+                const float d    = f16tof32(w & 0xFFFFu);
+                const float dmin = f16tof32(w >> 16);
+                uint sc0, sc1, sc2;
+                LOAD_U32_UNALIGNED(src0, base + 4, sc0);
+                LOAD_U32_UNALIGNED(src0, base + 8, sc1);
+                LOAD_U32_UNALIGNED(src0, base + 12, sc2);
+                uint sc, mn;
+                if (s < 4) {
+                    sc = byte_of(sc0, s) & 63u;
+                    mn = byte_of(sc1, s) & 63u;
+                } else {
+                    sc = (byte_of(sc2, s - 4) & 0xFu) | ((byte_of(sc0, s - 4) >> 6) << 4);
+                    mn = (byte_of(sc2, s - 4) >> 4) | ((byte_of(sc1, s - 4) >> 6) << 4);
+                }
+                ad = d * (float) sc;
+                am = dmin * (float) mn;
+                const uint shift = (s & 1u) * 4u;
+                const uint qbase = base + 16 + 32 * (s / 2) + 16 * a_part;
+                [unroll] for (uint j = 0; j < A_WORDS; j++) {
+                    uint q;
+                    LOAD_U32_UNALIGNED(src0, qbase + 4 * j, q);
+                    aw[j] = (q >> shift) & 0x0F0F0F0Fu;
+                }
+#elif defined(SRC0_Q6_K)
+                // super-block of 256: 128 bytes ql, 64 bytes qh, 16 int8 scales, f16 d; the two threads of a row take one scale each
+                const uint blk  = kt / 256;
+                const uint s    = (kt % 256) / 32;
+                const uint h    = s / 4;
+                const uint t    = s % 4;
+                const uint base = (a_batch + a_r * stride_01 + blk) * 210;
+                uint dbits;
+                LOAD_U16_UNALIGNED(src0, base + 208, dbits);
+                const uint ql_base = base + 64 * h + 32 * (t & 1u) + 16 * a_part;
+                const uint qh_base = base + 128 + 32 * h + 16 * a_part;
+                const uint sc_base = base + 192 + 8 * h + 2 * t;
+                const uint lshift  = (t >> 1) * 4u;
+                const uint hshift  = t * 2u;
+                uint scw;
+                LOAD_U32_UNALIGNED(src0, sc_base, scw);
+                ad = f16tof32(dbits) * (float) sbyte_of(scw, a_part);   // this thread's half: scale a_part
+                [unroll] for (uint j = 0; j < A_WORDS; j++) {
+                    uint ql, qh;
+                    LOAD_U32_UNALIGNED(src0, ql_base + 4 * j, ql);
+                    LOAD_U32_UNALIGNED(src0, qh_base + 4 * j, qh);
+                    const uint v = ((ql >> lshift) & 0x0F0F0F0Fu) | (((qh >> hshift) & 0x03030303u) << 4);
+                    aw[j] = ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;   // v - 32 per byte, no borrows
+                }
+#elif defined(SRC0_Q4_0)
+                const uint base = (a_batch + a_r * stride_01 + kt / 32) * 18;
+                uint dbits;
+                LOAD_U16_UNALIGNED(src0, base, dbits);
+                ad = f16tof32(dbits);
+                const uint e0    = a_part * A_ELEMS;
+                const bool high  = e0 >= 16;
+                const uint byte0 = e0 % 16;
+#if defined(BT_AL) && (A_WORDS == 4)
+                const uint p_al  = base + 2 + byte0;
+                const uint a0_al = p_al & ~3u;
+                const uint4 w4_al = src0.Load4(a0_al);
+                const uint  w5_al = src0.Load(a0_al + 16);
+                const bool sh_al = (p_al & 2u) != 0u;
+                uint qv_al[4];
+                qv_al[0] = sh_al ? ((w4_al.x >> 16) | (w4_al.y << 16)) : w4_al.x;
+                qv_al[1] = sh_al ? ((w4_al.y >> 16) | (w4_al.z << 16)) : w4_al.y;
+                qv_al[2] = sh_al ? ((w4_al.z >> 16) | (w4_al.w << 16)) : w4_al.z;
+                qv_al[3] = sh_al ? ((w4_al.w >> 16) | (w5_al << 16)) : w4_al.w;
+                [unroll] for (uint j = 0; j < A_WORDS; j++) {
+                    const uint q = qv_al[j];
+                    const uint nib = (high ? (q >> 4) : q) & 0x0F0F0F0Fu;
+#else
+                [unroll] for (uint j = 0; j < A_WORDS; j++) {
+                    uint q;
+                    LOAD_U32_UNALIGNED(src0, base + 2 + byte0 + 4 * j, q);
+                    const uint nib = (high ? (q >> 4) : q) & 0x0F0F0F0Fu;
+#endif
+                    // nibble - 8 per byte without borrows: set bit 7, subtract 8, flip bit 7
+                    aw[j] = ((nib | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+                }
+#else
+                const uint base = (a_batch + a_r * stride_01 + kt / 32) * 34;
+                uint dbits;
+                LOAD_U16_UNALIGNED(src0, base, dbits);
+                ad = f16tof32(dbits);
+#if defined(BT_AL) && (A_WORDS == 4)
+                const uint p_al  = base + 2 + a_part * A_ELEMS;
+                const uint a0_al = p_al & ~3u;
+                const uint4 w4_al = src0.Load4(a0_al);
+                const uint  w5_al = src0.Load(a0_al + 16);
+                const bool sh_al = (p_al & 2u) != 0u;
+                uint qv_al[4];
+                qv_al[0] = sh_al ? ((w4_al.x >> 16) | (w4_al.y << 16)) : w4_al.x;
+                qv_al[1] = sh_al ? ((w4_al.y >> 16) | (w4_al.z << 16)) : w4_al.y;
+                qv_al[2] = sh_al ? ((w4_al.z >> 16) | (w4_al.w << 16)) : w4_al.z;
+                qv_al[3] = sh_al ? ((w4_al.w >> 16) | (w5_al << 16)) : w4_al.w;
+                aw[0] = qv_al[0];
+                aw[1] = qv_al[1];
+                aw[2] = qv_al[2];
+                aw[3] = qv_al[3];
+#else
+                [unroll] for (uint j = 0; j < A_WORDS; j++) {
+                    LOAD_U32_UNALIGNED(src0, base + 2 + a_part * A_ELEMS + 4 * j, aw[j]);
+                }
+#endif
+#endif
+            }
+            [unroll] for (uint z2 = 0; z2 < A_WORDS; z2++) {
+                Aq[a_part * A_WORDS + z2][a_row] = aw[z2];
+            }
+#if A_MODE == 2
+            if (a_part == 0) {
+                Ad[a_row] = ad;
+            } else {
+                Am[a_row] = ad;
+            }
+#else
+            if (a_part == 0) {
+                Ad[a_row] = ad;
+                Am[a_row] = am;
+            }
+#endif
+        }
+        float bv[B_ELEMS];
+        float amax = 0.0f;
+        [unroll] for (uint i = 0; i < B_ELEMS; i++) {
+            const uint ki = b_part * B_ELEMS + i;
+#if defined(SRC1_F16)
+            uint bits;
+            LOAD_U16_UNALIGNED(src1, (b_base + kt + ki) * 2, bits);
+            bv[i] = b_ok ? f16tof32(bits) : 0.0f;
+#else
+            bv[i] = b_ok ? LOAD_F32(src1, b_base + kt + ki) : 0.0f;
+#endif
+            amax = max(amax, abs(bv[i]));
+        }
+        Bmx[b_col][b_part] = amax;
+        GroupMemoryBarrierWithGroupSync();
+        float mx = 0.0f;
+        [unroll] for (uint p = 0; p < B_PARTS; p++) {
+            mx = max(mx, Bmx[b_col][p]);
+        }
+        const float inv = mx > 0.0f ? 127.0f / mx : 0.0f;
+        int qsum = 0;
+        [unroll] for (uint jw = 0; jw < B_WORDS; jw++) {
+            uint w = 0u;
+            [unroll] for (uint bb = 0; bb < 4; bb++) {
+                const int qv = (int) round(bv[jw * 4 + bb] * inv);
+                qsum += qv;
+                w |= ((uint) (qv & 0xFF)) << (8u * bb);
+            }
+            Bq[b_part * B_WORDS + jw][b_col] = w;
+        }
+#if A_MODE == 1
+        Bsm[b_col][b_part] = (float) qsum;
+#endif
+        if (b_part == 0) {
+            Bd[b_col] = mx / 127.0f;
+        }
+#if A_MODE == 1
+        GroupMemoryBarrierWithGroupSync();   // the part sums are read below; costs one more barrier per k step on Q4_K only
+        if (b_part == 0) {
+            float bs = 0.0f;
+            [unroll] for (uint p2 = 0; p2 < B_PARTS; p2++) {
+                bs += Bsm[b_col][p2];
+            }
+            Bs[b_col] = bs;
+        }
+#endif
+        GroupMemoryBarrierWithGroupSync();
+
+        int isum[REG_M][REG_N];
+#if A_MODE == 2
+        int ihi[REG_M][REG_N];
+#endif
+        [unroll] for (uint im1 = 0; im1 < REG_M; im1++) {
+            [unroll] for (uint jn1 = 0; jn1 < REG_N; jn1++) {
+                isum[im1][jn1] = 0;
+#if A_MODE == 2
+                ihi[im1][jn1] = 0;
+#endif
+            }
+        }
+        [unroll] for (uint wd = 0; wd < 8; wd++) {
+            uint a[REG_M], b[REG_N];
+            [unroll] for (uint im2 = 0; im2 < REG_M; im2++) {
+                a[im2] = Aq[wd][BT_ROW(im2)];
+            }
+            [unroll] for (uint in2 = 0; in2 < REG_N; in2++) {
+                b[in2] = Bq[wd][BT_COL(in2)];
+            }
+            [unroll] for (uint im3 = 0; im3 < REG_M; im3++) {
+                [unroll] for (uint in3 = 0; in3 < REG_N; in3++) {
+#if A_MODE == 2
+                    if (wd < 4) {
+                        isum[im3][in3] = dot4add_i8packed(a[im3], b[in3], isum[im3][in3]);
+                    } else {
+                        ihi[im3][in3] = dot4add_i8packed(a[im3], b[in3], ihi[im3][in3]);
+                    }
+#else
+                    isum[im3][in3] = dot4add_i8packed(a[im3], b[in3], isum[im3][in3]);
+#endif
+                }
+            }
+        }
+        float sa[REG_M], sm[REG_M], sb[REG_N], sbs[REG_N];
+        [unroll] for (uint im4 = 0; im4 < REG_M; im4++) {
+            sa[im4] = Ad[BT_ROW(im4)];
+            sm[im4] = Am[BT_ROW(im4)];
+        }
+        [unroll] for (uint in4 = 0; in4 < REG_N; in4++) {
+            sb[in4] = Bd[BT_COL(in4)];
+#if A_MODE == 1
+            sbs[in4] = Bs[BT_COL(in4)];
+#else
+            sbs[in4] = 0.0f;
+#endif
+        }
+        [unroll] for (uint im5 = 0; im5 < REG_M; im5++) {
+            [unroll] for (uint in5 = 0; in5 < REG_N; in5++) {
+#if A_MODE == 1
+                acc[im5][in5] += sb[in5] * (sa[im5] * (float) isum[im5][in5] - sm[im5] * sbs[in5]);
+#elif A_MODE == 2
+                acc[im5][in5] += sb[in5] * (sa[im5] * (float) isum[im5][in5] + sm[im5] * (float) ihi[im5][in5]);
+#else
+                acc[im5][in5] += (float) isum[im5][in5] * (sa[im5] * sb[in5]);
+#endif
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    const uint dst_base = offset_dst + dst3_idx * (m * n * ne2) + dst2_idx * (m * n);
+    [unroll] for (uint jn4 = 0; jn4 < REG_N; jn4++) {
+        const uint c = col0 + BT_COL(jn4);
+        if (c >= n) {
+            continue;
+        }
+        [unroll] for (uint im6 = 0; im6 < REG_M; im6++) {
+            const uint r = row0 + BT_ROW(im6);
+            if (r < m) {
+                STORE_F32(dst, dst_base + c * m + r, acc[im6][jn4]);
+            }
+        }
+    }
+}
+#else   // BT_DP4A
 #ifndef BT_AMODE
 #define BT_AMODE 0
 #endif
@@ -79,7 +444,7 @@ cbuffer Params : register(b0) {
     uint nwg_x;
 };
 
-#if BT_HALF && BT_BVEC && BT_LAYOUT == 1 && !defined(SRC1_F16) && (A_ELEMS == 32)
+#if BT_HALF && BT_BVEC && BT_LAYOUT == 1 && !defined(SRC1_F16) && (A_ELEMS == 32 || A_ELEMS == 16 || A_ELEMS == 8)
 #define HALF_ON 1
 groupshared uint Atile[TILE_K / 2][TILE_M];
 groupshared uint Btile[TILE_K / 2][TILE_N];
@@ -216,8 +581,8 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             }
         }
 #if HALF_ON
-        [unroll] for (uint kp = 0; kp < 16; kp++) {
-            Atile[kp][a_row] = f32tof16(vals[2 * kp]) | (f32tof16(vals[2 * kp + 1]) << 16);
+        [unroll] for (uint kp = 0; kp < A_ELEMS / 2; kp++) {
+            Atile[a_part * (A_ELEMS / 2) + kp][a_row] = f32tof16(vals[2 * kp]) | (f32tof16(vals[2 * kp + 1]) << 16);
         }
 #else
         [unroll] for (uint ki = 0; ki < A_ELEMS; ki++) {
@@ -313,6 +678,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
     }
 }
+#endif   // BT_DP4A
 #else
 #define TILE_M 64
 #define TILE_N 32
