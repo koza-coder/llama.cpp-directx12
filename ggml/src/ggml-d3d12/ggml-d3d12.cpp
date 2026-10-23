@@ -66,6 +66,7 @@
 #define GGML_D3D12_BT_ASPLIT 1
 #define GGML_D3D12_BT_AMODE 2
 #define GGML_D3D12_BT_BVEC 1
+#define GGML_D3D12_BT_HALF 1
 // exp504: bigger register tile for the dense Q4_0 / Q8_0 prompt matmul (0 = old 64 x 32 tile)
 #ifndef GGML_D3D12_BIGTILE
 #define GGML_D3D12_BIGTILE 1
@@ -1615,6 +1616,9 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
 #endif
 #ifdef GGML_D3D12_BT_BVEC
         defines.push_back("BT_BVEC=" + std::to_string(GGML_D3D12_BT_BVEC));
+#endif
+#ifdef GGML_D3D12_BT_HALF
+        defines.push_back("BT_HALF=" + std::to_string(GGML_D3D12_BT_HALF));
 #endif
     }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines);

@@ -27,6 +27,9 @@
 #ifndef BT_BVEC
 #define BT_BVEC 0
 #endif
+#ifndef BT_HALF
+#define BT_HALF 0
+#endif
 // exp526: BT_AMODE 2 = one thread loads the whole 18-byte Q4_0 block as 5 aligned words (needs BT_ASPLIT=1); BT_BVEC 1 = float4 loads of the f32 columns
 // exp504: bigger register tile for the dense prompt path (Q4_0 / Q8_0, f32 or f16 columns, no MMID).
 // 128 x 64 tile of dst per workgroup, k in steps of 32, 256 threads; each thread owns 8 rows x 4 columns
@@ -76,8 +79,15 @@ cbuffer Params : register(b0) {
     uint nwg_x;
 };
 
+#if BT_HALF && BT_BVEC && BT_LAYOUT == 1 && !defined(SRC1_F16) && (A_ELEMS == 32)
+#define HALF_ON 1
+groupshared uint Atile[TILE_K / 2][TILE_M];
+groupshared uint Btile[TILE_K / 2][TILE_N];
+#else
+#define HALF_ON 0
 groupshared float Atile[TILE_K][TILE_M];
 groupshared float Btile[TILE_K][TILE_N];
+#endif
 
 [numthreads(NTHREADS, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
@@ -205,9 +215,15 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                 vals[z] = 0.0f;
             }
         }
+#if HALF_ON
+        [unroll] for (uint kp = 0; kp < 16; kp++) {
+            Atile[kp][a_row] = f32tof16(vals[2 * kp]) | (f32tof16(vals[2 * kp + 1]) << 16);
+        }
+#else
         [unroll] for (uint ki = 0; ki < A_ELEMS; ki++) {
             Atile[a_part * A_ELEMS + ki][a_row] = vals[ki];
         }
+#endif
         }
 #if BT_BVEC && !defined(SRC1_F16)
         [unroll] for (uint i4 = 0; i4 < B_ELEMS / 4; i4++) {
@@ -216,10 +232,15 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             if (b_ok) {
                 bv = asfloat(src1.Load4((b_base + kt + ki0) * 4));
             }
+#if HALF_ON
+            Btile[ki0 / 2][b_col] = f32tof16(bv.x) | (f32tof16(bv.y) << 16);
+            Btile[ki0 / 2 + 1][b_col] = f32tof16(bv.z) | (f32tof16(bv.w) << 16);
+#else
             Btile[ki0][b_col] = bv.x;
             Btile[ki0 + 1][b_col] = bv.y;
             Btile[ki0 + 2][b_col] = bv.z;
             Btile[ki0 + 3][b_col] = bv.w;
+#endif
         }
 #else
         [unroll] for (uint i = 0; i < B_ELEMS; i++) {
@@ -235,6 +256,31 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 #endif
         GroupMemoryBarrierWithGroupSync();
 
+#if HALF_ON
+        [unroll] for (uint kp = 0; kp < TILE_K / 2; kp++) {
+            uint a2[REG_M], b2[REG_N];
+            [unroll] for (uint im2 = 0; im2 < REG_M; im2++) {
+                a2[im2] = Atile[kp][BT_ROW(im2)];
+            }
+            [unroll] for (uint in2 = 0; in2 < REG_N; in2++) {
+                b2[in2] = Btile[kp][BT_COL(in2)];
+            }
+            [unroll] for (uint hh = 0; hh < 2; hh++) {
+                float a[REG_M], b[REG_N];
+                [unroll] for (uint im5 = 0; im5 < REG_M; im5++) {
+                    a[im5] = f16tof32(hh == 0 ? (a2[im5] & 0xFFFFu) : (a2[im5] >> 16));
+                }
+                [unroll] for (uint in5 = 0; in5 < REG_N; in5++) {
+                    b[in5] = f16tof32(hh == 0 ? (b2[in5] & 0xFFFFu) : (b2[in5] >> 16));
+                }
+                [unroll] for (uint im6 = 0; im6 < REG_M; im6++) {
+                    [unroll] for (uint in6 = 0; in6 < REG_N; in6++) {
+                        acc[im6][in6] += a[im6] * b[in6];
+                    }
+                }
+            }
+        }
+#else
         [unroll] for (uint kk = 0; kk < TILE_K; kk++) {
             float a[REG_M], b[REG_N];
             [unroll] for (uint im2 = 0; im2 < REG_M; im2++) {
@@ -249,6 +295,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                 }
             }
         }
+#endif
         GroupMemoryBarrierWithGroupSync();
     }
 
