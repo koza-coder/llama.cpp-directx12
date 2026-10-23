@@ -403,6 +403,177 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 #endif
 }
+#elif defined(GQ)
+// GQ: like DECODE, but one workgroup scores GQ consecutive heads (rows) that share the KV head and the mask row, so
+// the K and V rows of the block are read once for all of them. Host: GQ divides q heads per KV head, mask_ne2 == 1,
+// max_bias == 0, row0 and n_rows multiples of GQ. Same tmp layout (one entry per row), COMBINE is unchanged.
+groupshared float q_sh[GQ * DK];
+groupshared float p_sh[GQ * WG_SIZE];
+groupshared float red_sh[GQ * WG_SIZE];
+groupshared uint  vis_sh;
+
+[numthreads(WG_SIZE, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    const uint wg  = gid.x + nwg_x * gid.y;
+    const uint tid = gtid.x;
+    if (wg >= (n_rows / GQ) * n_blocks) {
+        return;
+    }
+    const uint t0  = (wg / n_blocks) * GQ;
+    const uint b   = wg % n_blocks;
+    const uint row = row0 + t0;
+    const uint i3  = row / (n_q * n_head);
+    const uint i1  = (row % (n_q * n_head)) / n_head;
+    const uint i2  = row % n_head;
+
+    const uint j = b * blk_size + tid;
+    bool  visible = j < n_kv;
+    float mv = 0.0f;
+#if defined(HAS_MASK)
+    if (visible) {
+        const uint m_base = offset_mask + (i3 % mask_ne3) * stride_m3 + (i2 % mask_ne2) * stride_m2 + i1 * stride_m1;
+        uint mbits;
+        LOAD_U16_UNALIGNED(mask, (m_base + j) * 2, mbits);
+        visible = mbits != 0xFC00u;
+        mv = f16tof32(mbits);
+    }
+#endif
+    if (tid == 0) {
+        vis_sh = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (visible) {
+        InterlockedOr(vis_sh, 1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (vis_sh == 0) {
+        // block fully masked for every head of the group
+        if (tid < GQ) {
+            STORE_F32(tmp, ((t0 + tid) * n_blocks + b) * (DV + 1), NEG_INF_SCORE);
+        }
+        return;
+    }
+
+    [unroll] for (uint g = 0; g < GQ; g++) {
+        const uint q_base = offset_q + i3 * stride_q3 + (i2 + g) * stride_q2 + i1 * stride_q1;
+        for (uint a = tid; a < DK; a += WG_SIZE) {
+            q_sh[g * DK + a] = LOAD_F32(q_buf, q_base + a);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint k_base = offset_k + (i3 / rk3) * stride_k3 + (i2 / rk2) * stride_k2;
+    const uint v_base = offset_v + (i3 / rv3) * stride_v3 + (i2 / rv2) * stride_v2;
+
+    float s[GQ];
+    [unroll] for (uint g0 = 0; g0 < GQ; g0++) {
+        s[g0] = NEG_INF_SCORE;
+    }
+    if (visible) {
+#if defined(K_BLOCK)
+        const uint kj = (k_base + j * stride_k1) * 32u;
+#else
+        const uint kj = k_base + j * stride_k1;
+#endif
+        float d[GQ];
+        [unroll] for (uint g1 = 0; g1 < GQ; g1++) {
+            d[g1] = 0.0f;
+        }
+        for (uint a = 0; a < DK / 4; a++) {
+            const float4 kv = load_k4(kj + 4 * a);
+            [unroll] for (uint g2 = 0; g2 < GQ; g2++) {
+                d[g2] += dot(float4(q_sh[g2 * DK + 4 * a], q_sh[g2 * DK + 4 * a + 1], q_sh[g2 * DK + 4 * a + 2], q_sh[g2 * DK + 4 * a + 3]), kv);
+            }
+        }
+        [unroll] for (uint g3 = 0; g3 < GQ; g3++) {
+            float dd = d[g3] * scale;
+#if defined(SOFTCAP)
+            dd = logit_softcap * tanh(dd);
+#endif
+            s[g3] = dd + mv;
+        }
+    }
+
+    // block maximum of every head
+    [unroll] for (uint g4 = 0; g4 < GQ; g4++) {
+        red_sh[g4 * WG_SIZE + tid] = s[g4];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint h = WG_SIZE / 2; h > 0; h /= 2) {
+        if (tid < h) {
+            [unroll] for (uint g5 = 0; g5 < GQ; g5++) {
+                red_sh[g5 * WG_SIZE + tid] = max(red_sh[g5 * WG_SIZE + tid], red_sh[g5 * WG_SIZE + tid + h]);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float M[GQ];
+    [unroll] for (uint g6 = 0; g6 < GQ; g6++) {
+        M[g6] = red_sh[g6 * WG_SIZE];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll] for (uint g7 = 0; g7 < GQ; g7++) {
+        const float p = s[g7] <= NEG_INF_SCORE ? 0.0f : exp(s[g7] - M[g7]);
+        p_sh[g7 * WG_SIZE + tid] = p;
+        red_sh[g7 * WG_SIZE + tid] = p;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint h2 = WG_SIZE / 2; h2 > 0; h2 /= 2) {
+        if (tid < h2) {
+            [unroll] for (uint g8 = 0; g8 < GQ; g8++) {
+                red_sh[g8 * WG_SIZE + tid] += red_sh[g8 * WG_SIZE + tid + h2];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float S[GQ];
+    [unroll] for (uint g9 = 0; g9 < GQ; g9++) {
+        S[g9] = red_sh[g9 * WG_SIZE];
+    }
+    if (tid == 0) {
+        [unroll] for (uint ga = 0; ga < GQ; ga++) {
+            STORE_F32(tmp, ((t0 + ga) * n_blocks + b) * (DV + 1), S[ga] == 0.0f ? NEG_INF_SCORE : M[ga] + log(S[ga]));
+        }
+    }
+    const uint jn = min(blk_size, n_kv - b * blk_size);
+    // thread tid owns 4 consecutive output elements per step, for every head of the group
+    for (uint d4 = tid; d4 < DV / 4; d4 += WG_SIZE) {
+        float4 acc[GQ];
+        [unroll] for (uint gb = 0; gb < GQ; gb++) {
+            acc[gb] = 0.0f;
+        }
+        for (uint jj = 0; jj < jn; jj++) {
+            float pj[GQ];
+            bool  anyp = false;
+            [unroll] for (uint gc = 0; gc < GQ; gc++) {
+                pj[gc] = p_sh[gc * WG_SIZE + jj];
+                anyp = anyp || pj[gc] != 0.0f;
+            }
+            if (anyp) {
+#if defined(V_BLOCK)
+                const uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
+#else
+                const uint vj = v_base + (b * blk_size + jj) * stride_v1;
+#endif
+                const float4 vv = load_v4(vj + 4 * d4);
+                [unroll] for (uint gd = 0; gd < GQ; gd++) {
+                    acc[gd] += pj[gd] * vv;
+                }
+            }
+        }
+        [unroll] for (uint ge = 0; ge < GQ; ge++) {
+            if (S[ge] != 0.0f) {
+                const uint  base = ((t0 + ge) * n_blocks + b) * (DV + 1);
+                const float4 o   = acc[ge] / S[ge];
+                STORE_F32(tmp, base + 1 + 4 * d4, o.x);
+                STORE_F32(tmp, base + 2 + 4 * d4, o.y);
+                STORE_F32(tmp, base + 3 + 4 * d4, o.z);
+                STORE_F32(tmp, base + 4 + 4 * d4, o.w);
+            }
+        }
+    }
+}
 #else
 // DECODE: pass 1 with one workgroup per (output row, block of WG_SIZE KV entries), for few query rows. Thread
 // j scores KV entry j, then thread d sums the softmax-weighted values of output element d. Same tmp layout.

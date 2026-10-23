@@ -3524,9 +3524,24 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
     static const char * fa_env = getenv("GGML_D3D12_FA_PROMPT_DECODE");
     const bool     prompt_decode = fa_env ? atoi(fa_env) != 0 : dev.vendor_id == 0x1ED5;
     const bool     decode = (q->ne[1] == 1 || prompt_decode) && !dev.no_fuse;
+    // exp539: GQ query heads that share one KV head (and one mask row) go into one workgroup; prompt rows on Moore Threads only
+    uint32_t gq = 1;
+    if (decode && q->ne[1] > 1 && dev.vendor_id == 0x1ED5 && max_bias == 0.0f && (!mask || mask->ne[2] == 1) &&
+        k->ne[2] == v->ne[2] && q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]) {
+        static const char * gq_env = getenv("GGML_D3D12_FA_GQ");
+        gq = gq_env ? (uint32_t) atoi(gq_env) : 4u;
+        const uint32_t rk2_h = (uint32_t) (q->ne[2] / k->ne[2]);
+        while (gq > 1 && (rk2_h % gq != 0 || (uint32_t) q->ne[2] % gq != 0)) {
+            gq /= 2;
+        }
+        gq = std::max<uint32_t>(gq, 1u);
+    }
     const uint32_t blk    = decode ? D3D12_WG_SIZE : D3D12_FLASH_ATTN_BLK;
     if (decode) {
         defines.push_back("DECODE");
+        if (gq > 1) {
+            defines.push_back("GQ=" + std::to_string(gq));
+        }
     } else {
         defines.push_back("WG_SIZE=" + std::to_string(D3D12_FLASH_ATTN_WG));
         if (dev.vendor_id == 0x8086) {
@@ -3593,6 +3608,9 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
 
     for (uint64_t row0 = 0, n = 0; row0 < n_rows; row0 += n) {
         n = std::min(n_rows - row0, std::max<uint64_t>(1, std::min(dev.fa_work / row_work, tmp_rows)));
+        if (gq > 1) {
+            n = std::max<uint64_t>(gq, n - n % gq);   // row0 and n stay multiples of gq (n_rows is a multiple of n_head)
+        }
         params[row0_idx]     = (uint32_t) row0;
         params[row0_idx + 1] = (uint32_t) n;
         if (big && dev.dispatches_in_list > 0) {
@@ -3613,7 +3631,7 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
         }
         const std::vector<D3D12_GPU_VIRTUAL_ADDRESS> uavs = { bq.va, bk.va, bv.va, bm.va, bs.va, bd.va, tmp_va };
         ggml_d3d12_dispatch(dev, pipeline, params, uavs,
-                            decode ? (uint32_t) n * n_blocks : CEIL_DIV((uint32_t) n * n_blocks, (uint32_t) D3D12_FLASH_ATTN_WG));
+                            decode ? (uint32_t) (n / gq) * n_blocks : CEIL_DIV((uint32_t) n * n_blocks, (uint32_t) D3D12_FLASH_ATTN_WG));
         ggml_d3d12_dispatch(dev, combine, params, uavs, CEIL_DIV((uint32_t) n, (uint32_t) D3D12_FLASH_ATTN_WG));
     }
 }
