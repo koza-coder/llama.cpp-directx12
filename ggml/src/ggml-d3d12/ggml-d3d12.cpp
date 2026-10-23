@@ -1595,7 +1595,7 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     }
     // exp504: 128 x 64 tile with 8 x 4 values per thread for Q4_0 / Q8_0 from 64 columns
     static const char * bt_env = getenv("GGML_D3D12_BIGTILE");
-    const bool bt_on = bt_env ? atoi(bt_env) != 0 : (GGML_D3D12_BIGTILE != 0 && dev.vendor_id == 0x1ED5);
+    const bool bt_on = bt_env ? atoi(bt_env) != 0 : GGML_D3D12_BIGTILE != 0;
     const bool big = bt_on && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && dst->ne[1] >= (uint32_t) GGML_D3D12_BT_TN;
     if (big) {
         defines.push_back("BIG_TILE");
@@ -3524,13 +3524,13 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
     // one query row (decode): a workgroup per (row, KV block) instead of a thread
     // exp509/exp510: on the Moore Threads S80 the prompt kernel (pass 1) took 26 ms per call (the registers of q and acc
     // spill at head size 256/512); the workgroup-per-(row, block) kernel takes 1.5 ms. GGML_D3D12_FA_PROMPT_DECODE=0/1
-    // overrides the vendor default (1 on Moore Threads, 0 elsewhere).
+    // overrides the default (1 on every vendor since v0.3.5; exp559/exp563: RX and Intel gain too).
     static const char * fa_env = getenv("GGML_D3D12_FA_PROMPT_DECODE");
-    const bool     prompt_decode = fa_env ? atoi(fa_env) != 0 : dev.vendor_id == 0x1ED5;
+    const bool     prompt_decode = fa_env ? atoi(fa_env) != 0 : true;
     const bool     decode = (q->ne[1] == 1 || prompt_decode) && !dev.no_fuse;
-    // exp539: GQ query heads that share one KV head (and one mask row) go into one workgroup; prompt rows on Moore Threads only
+    // exp539: GQ query heads that share one KV head (and one mask row) go into one workgroup; prompt rows on every vendor (GGML_D3D12_FA_GQ=1 turns it off)
     uint32_t gq = 1;
-    if (decode && q->ne[1] > 1 && dev.vendor_id == 0x1ED5 && max_bias == 0.0f && (!mask || mask->ne[2] == 1) &&
+    if (decode && q->ne[1] > 1 && max_bias == 0.0f && (!mask || mask->ne[2] == 1) &&
         k->ne[2] == v->ne[2] && q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]) {
         static const char * gq_env = getenv("GGML_D3D12_FA_GQ");
         gq = gq_env ? (uint32_t) atoi(gq_env) : 4u;
@@ -5464,6 +5464,8 @@ static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t gg
     }
     if (const char * env = getenv("GGML_D3D12_MM_TPR")) {
         dev.mm_tpr_max = (uint32_t) std::max(1, atoi(env));
+    } else if (dev.vendor_id == 0x1ED5) {
+        dev.mm_tpr_max = 32; // exp568: decode (tg64) +20.7 % on the S80 (wave 128: fewer partial sums to reduce)
     }
     if (const char * env = getenv("GGML_D3D12_TILED")) {
         // column count from which the tiled prompt kernel takes over; 1 means "always when eligible"
