@@ -1592,6 +1592,19 @@ static bool ggml_d3d12_use_tiled(const d3d12_device_ctx & dev, ggml_tensor * src
            (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32;
 }
 
+// exp682: float weights whose K is not a multiple of 32 (K % 4 != 0 by default, every K with GGML_D3D12_TILED_TAIL=2) and enough columns for the tiled kernel
+static bool ggml_d3d12_use_tiled_tail(const d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+    static const char * env = getenv("GGML_D3D12_TILED_TAIL");
+    const int mode = env ? atoi(env) : 1;
+    if (mode == 0 || src0->ne[0] % 32 == 0 || (mode == 1 && src0->ne[0] % 4 == 0)) {
+        return false;
+    }
+    const uint32_t t_cols = (uint32_t) src0->type < (uint32_t) GGML_TYPE_COUNT ? dev.tiled_type_cols[src0->type] : 0;
+    const uint32_t gate   = t_cols != 0 ? t_cols : dev.tiled_min_cols;
+    return gate != 0 && (uint32_t) dst->ne[1] >= gate && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+           (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32;
+}
+
 // dst = src0 * src1 with a TILE_M x TILE_N tile of dst per workgroup; see mul_mat_tiled.hlsl
 static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                      ggml_tensor * dst) {
@@ -1603,6 +1616,9 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     std::vector<std::string> defines = { define };
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
+    }
+    if (src0->ne[0] % 32 != 0) {
+        defines.push_back("K_TAIL");   // exp682: last K tile guarded (F32 / F16 weights only, see ggml_d3d12_use_tiled_tail)
     }
     // exp504: 128 x 64 tile with 8 x 4 values per thread for Q4_0 / Q8_0 from 64 columns
     static const char * bt_env = getenv("GGML_D3D12_BIGTILE");
@@ -1721,6 +1737,10 @@ static uint32_t ggml_d3d12_tpr_cap(const d3d12_device_ctx & dev, uint32_t units)
 static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1, const std::vector<d3d12_mat_slot> & mats) {
     GGML_ASSERT(!mats.empty() && mats.size() <= 3);
     ggml_tensor * src0 = mats[0].src0;
+    if (mats.size() == 1 && mats[0].add == nullptr && ggml_d3d12_use_tiled_tail(dev, src0, src1, mats[0].dst)) {
+        ggml_d3d12_mul_mat_tiled(dev, src0, src1, mats[0].dst);
+        return;
+    }
     if (ggml_d3d12_mul_mat_scalar_needed(src0)) {
         GGML_ASSERT(mats.size() == 1 && mats[0].add == nullptr);
         ggml_d3d12_mul_mat_scalar(dev, src0, src1, mats[0].dst);
