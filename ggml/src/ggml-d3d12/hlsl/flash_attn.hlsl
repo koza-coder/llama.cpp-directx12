@@ -403,6 +403,374 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 #endif
 }
+#elif defined(QR)
+// exp633: Q-tiled prompt kernel. Like GQ (one workgroup per KV block, one thread per KV entry, same tmp layout, COMBINE unchanged),
+// but one workgroup scores NR = GQ * QR rows at once: GQ heads that share a KV head times QR consecutive query rows. Every K and V row
+// is read from memory once for all NR rows (the GQ kernel reads it once per query row: at pp2048 that is the whole run time on Intel).
+// Host: GQ divides q heads per KV head (GQ=1 when undefined), QR * GQ = 8, mask_ne2 == 1, max_bias == 0, n_q % QR == 0, chunks
+// (row0, n_rows) are multiples of QR * n_head rows, DK <= 256.
+#ifndef GQ
+#define GQ 1
+#endif
+#define NR (GQ * QR)
+groupshared float q_sh[NR * DK];
+groupshared float p_sh[NR * WG_SIZE];
+groupshared float red_sh[NR * WG_SIZE];
+groupshared uint  vis_sh;
+
+[numthreads(WG_SIZE, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    const uint wg  = gid.x + nwg_x * gid.y;
+    const uint tid = gtid.x;
+    const uint hgs = n_head / GQ;                       // head groups
+    const uint ntiles = (n_rows / (QR * n_head)) * hgs; // tiles of QR query rows x GQ heads in this chunk
+    if (wg >= ntiles * n_blocks) {
+        return;
+    }
+    const uint tile = wg / n_blocks;
+    const uint b    = wg % n_blocks;
+    const uint qgrp = tile / hgs;
+    const uint hgrp = tile % hgs;
+    const uint row_first = row0 + qgrp * QR * n_head;
+    const uint i3   = row_first / (n_q * n_head);
+    const uint i1_0 = (row_first % (n_q * n_head)) / n_head;
+    const uint i2_0 = hgrp * GQ;
+    const uint t_first = qgrp * QR * n_head + i2_0;      // tmp row of (qq = 0, g = 0); row (qq, g) is t_first + qq * n_head + g
+
+    const uint j = b * blk_size + tid;
+    bool  vq[QR];
+    float mv[QR];
+    bool  anyv = false;
+    [unroll] for (uint qa = 0; qa < QR; qa++) {
+        vq[qa] = j < n_kv;
+        mv[qa] = 0.0f;
+#if defined(HAS_MASK)
+        if (vq[qa]) {
+            const uint m_base = offset_mask + (i3 % mask_ne3) * stride_m3 + (i2_0 % mask_ne2) * stride_m2 + (i1_0 + qa) * stride_m1;
+            uint mbits;
+            LOAD_U16_UNALIGNED(mask, (m_base + j) * 2, mbits);
+            vq[qa] = mbits != 0xFC00u;
+            mv[qa] = f16tof32(mbits);
+        }
+#endif
+        anyv = anyv || vq[qa];
+    }
+    if (tid == 0) {
+        vis_sh = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (anyv) {
+        InterlockedOr(vis_sh, 1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (vis_sh == 0) {
+        // block fully masked for every row of the tile
+        if (tid < NR) {
+            STORE_F32(tmp, ((t_first + (tid / GQ) * n_head + (tid % GQ)) * n_blocks + b) * (DV + 1), NEG_INF_SCORE);
+        }
+        return;
+    }
+
+    [unroll] for (uint r0 = 0; r0 < NR; r0++) {
+        const uint q_base = offset_q + i3 * stride_q3 + (i2_0 + r0 % GQ) * stride_q2 + (i1_0 + r0 / GQ) * stride_q1;
+        for (uint a = tid; a < DK; a += WG_SIZE) {
+            q_sh[r0 * DK + a] = LOAD_F32(q_buf, q_base + a);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint k_base = offset_k + (i3 / rk3) * stride_k3 + (i2_0 / rk2) * stride_k2;
+    const uint v_base = offset_v + (i3 / rv3) * stride_v3 + (i2_0 / rv2) * stride_v2;
+
+    float s[NR];
+    [unroll] for (uint r1 = 0; r1 < NR; r1++) {
+        s[r1] = NEG_INF_SCORE;
+    }
+    if (j < n_kv) {
+#if defined(K_BLOCK)
+        const uint kj = (k_base + j * stride_k1) * 32u;
+#else
+        const uint kj = k_base + j * stride_k1;
+#endif
+        float d[NR];
+        [unroll] for (uint r2 = 0; r2 < NR; r2++) {
+            d[r2] = 0.0f;
+        }
+        for (uint a = 0; a < DK / 4; a++) {
+            const float4 kv = load_k4(kj + 4 * a);
+            [unroll] for (uint r3 = 0; r3 < NR; r3++) {
+                d[r3] += dot(float4(q_sh[r3 * DK + 4 * a], q_sh[r3 * DK + 4 * a + 1], q_sh[r3 * DK + 4 * a + 2], q_sh[r3 * DK + 4 * a + 3]), kv);
+            }
+        }
+        [unroll] for (uint r4 = 0; r4 < NR; r4++) {
+            float dd = d[r4] * scale;
+#if defined(SOFTCAP)
+            dd = logit_softcap * tanh(dd);
+#endif
+            if (vq[r4 / GQ]) {
+                s[r4] = dd + mv[r4 / GQ];
+            }
+        }
+    }
+
+    // block maximum of every row
+    [unroll] for (uint r5 = 0; r5 < NR; r5++) {
+        red_sh[r5 * WG_SIZE + tid] = s[r5];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint h = WG_SIZE / 2; h > 0; h /= 2) {
+        if (tid < h) {
+            [unroll] for (uint r6 = 0; r6 < NR; r6++) {
+                red_sh[r6 * WG_SIZE + tid] = max(red_sh[r6 * WG_SIZE + tid], red_sh[r6 * WG_SIZE + tid + h]);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float M[NR];
+    [unroll] for (uint r7 = 0; r7 < NR; r7++) {
+        M[r7] = red_sh[r7 * WG_SIZE];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll] for (uint r8 = 0; r8 < NR; r8++) {
+        const float p = s[r8] <= NEG_INF_SCORE ? 0.0f : exp(s[r8] - M[r8]);
+        p_sh[r8 * WG_SIZE + tid] = p;
+        red_sh[r8 * WG_SIZE + tid] = p;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint h2 = WG_SIZE / 2; h2 > 0; h2 /= 2) {
+        if (tid < h2) {
+            [unroll] for (uint r9 = 0; r9 < NR; r9++) {
+                red_sh[r9 * WG_SIZE + tid] += red_sh[r9 * WG_SIZE + tid + h2];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float S[NR];
+    [unroll] for (uint ra = 0; ra < NR; ra++) {
+        S[ra] = red_sh[ra * WG_SIZE];
+    }
+    if (tid < NR) {
+        // thread r stores the log-sum-exp of row r (the loop over r below would cost NR serial stores on thread 0)
+        float Sr = 0.0f;
+        float Mr = 0.0f;
+        [unroll] for (uint rb = 0; rb < NR; rb++) {
+            if (rb == tid) {
+                Sr = S[rb];
+                Mr = M[rb];
+            }
+        }
+        STORE_F32(tmp, ((t_first + (tid / GQ) * n_head + (tid % GQ)) * n_blocks + b) * (DV + 1), Sr == 0.0f ? NEG_INF_SCORE : Mr + log(Sr));
+    }
+    const uint jn = min(blk_size, n_kv - b * blk_size);
+    // thread tid owns 4 consecutive output elements per step, for every row of the tile
+    for (uint d4 = tid; d4 < DV / 4; d4 += WG_SIZE) {
+        float4 acc[NR];
+        [unroll] for (uint rc = 0; rc < NR; rc++) {
+            acc[rc] = 0.0f;
+        }
+        for (uint jj = 0; jj < jn; jj++) {
+            float pj[NR];
+            bool  anyp = false;
+            [unroll] for (uint rd = 0; rd < NR; rd++) {
+                pj[rd] = p_sh[rd * WG_SIZE + jj];
+                anyp = anyp || pj[rd] != 0.0f;
+            }
+            if (anyp) {
+#if defined(V_BLOCK)
+                const uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
+#else
+                const uint vj = v_base + (b * blk_size + jj) * stride_v1;
+#endif
+                const float4 vv = load_v4(vj + 4 * d4);
+                [unroll] for (uint re = 0; re < NR; re++) {
+                    acc[re] += pj[re] * vv;
+                }
+            }
+        }
+        [unroll] for (uint rf = 0; rf < NR; rf++) {
+            if (S[rf] != 0.0f) {
+                const uint  base = ((t_first + (rf / GQ) * n_head + (rf % GQ)) * n_blocks + b) * (DV + 1);
+                const float4 o   = acc[rf] / S[rf];
+                STORE_F32(tmp, base + 1 + 4 * d4, o.x);
+                STORE_F32(tmp, base + 2 + 4 * d4, o.y);
+                STORE_F32(tmp, base + 3 + 4 * d4, o.z);
+                STORE_F32(tmp, base + 4 + 4 * d4, o.w);
+            }
+        }
+    }
+}
+#elif defined(GQ)
+// GQ: like DECODE, but one workgroup scores GQ consecutive heads (rows) that share the KV head and the mask row, so
+// the K and V rows of the block are read once for all of them. Host: GQ divides q heads per KV head, mask_ne2 == 1,
+// max_bias == 0, row0 and n_rows multiples of GQ. Same tmp layout (one entry per row), COMBINE is unchanged.
+groupshared float q_sh[GQ * DK];
+groupshared float p_sh[GQ * WG_SIZE];
+groupshared float red_sh[GQ * WG_SIZE];
+groupshared uint  vis_sh;
+
+[numthreads(WG_SIZE, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    const uint wg  = gid.x + nwg_x * gid.y;
+    const uint tid = gtid.x;
+    if (wg >= (n_rows / GQ) * n_blocks) {
+        return;
+    }
+    const uint t0  = (wg / n_blocks) * GQ;
+    const uint b   = wg % n_blocks;
+    const uint row = row0 + t0;
+    const uint i3  = row / (n_q * n_head);
+    const uint i1  = (row % (n_q * n_head)) / n_head;
+    const uint i2  = row % n_head;
+
+    const uint j = b * blk_size + tid;
+    bool  visible = j < n_kv;
+    float mv = 0.0f;
+#if defined(HAS_MASK)
+    if (visible) {
+        const uint m_base = offset_mask + (i3 % mask_ne3) * stride_m3 + (i2 % mask_ne2) * stride_m2 + i1 * stride_m1;
+        uint mbits;
+        LOAD_U16_UNALIGNED(mask, (m_base + j) * 2, mbits);
+        visible = mbits != 0xFC00u;
+        mv = f16tof32(mbits);
+    }
+#endif
+    if (tid == 0) {
+        vis_sh = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (visible) {
+        InterlockedOr(vis_sh, 1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (vis_sh == 0) {
+        // block fully masked for every head of the group
+        if (tid < GQ) {
+            STORE_F32(tmp, ((t0 + tid) * n_blocks + b) * (DV + 1), NEG_INF_SCORE);
+        }
+        return;
+    }
+
+    [unroll] for (uint g = 0; g < GQ; g++) {
+        const uint q_base = offset_q + i3 * stride_q3 + (i2 + g) * stride_q2 + i1 * stride_q1;
+        for (uint a = tid; a < DK; a += WG_SIZE) {
+            q_sh[g * DK + a] = LOAD_F32(q_buf, q_base + a);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint k_base = offset_k + (i3 / rk3) * stride_k3 + (i2 / rk2) * stride_k2;
+    const uint v_base = offset_v + (i3 / rv3) * stride_v3 + (i2 / rv2) * stride_v2;
+
+    float s[GQ];
+    [unroll] for (uint g0 = 0; g0 < GQ; g0++) {
+        s[g0] = NEG_INF_SCORE;
+    }
+    if (visible) {
+#if defined(K_BLOCK)
+        const uint kj = (k_base + j * stride_k1) * 32u;
+#else
+        const uint kj = k_base + j * stride_k1;
+#endif
+        float d[GQ];
+        [unroll] for (uint g1 = 0; g1 < GQ; g1++) {
+            d[g1] = 0.0f;
+        }
+        for (uint a = 0; a < DK / 4; a++) {
+            const float4 kv = load_k4(kj + 4 * a);
+            [unroll] for (uint g2 = 0; g2 < GQ; g2++) {
+                d[g2] += dot(float4(q_sh[g2 * DK + 4 * a], q_sh[g2 * DK + 4 * a + 1], q_sh[g2 * DK + 4 * a + 2], q_sh[g2 * DK + 4 * a + 3]), kv);
+            }
+        }
+        [unroll] for (uint g3 = 0; g3 < GQ; g3++) {
+            float dd = d[g3] * scale;
+#if defined(SOFTCAP)
+            dd = logit_softcap * tanh(dd);
+#endif
+            s[g3] = dd + mv;
+        }
+    }
+
+    // block maximum of every head
+    [unroll] for (uint g4 = 0; g4 < GQ; g4++) {
+        red_sh[g4 * WG_SIZE + tid] = s[g4];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint h = WG_SIZE / 2; h > 0; h /= 2) {
+        if (tid < h) {
+            [unroll] for (uint g5 = 0; g5 < GQ; g5++) {
+                red_sh[g5 * WG_SIZE + tid] = max(red_sh[g5 * WG_SIZE + tid], red_sh[g5 * WG_SIZE + tid + h]);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float M[GQ];
+    [unroll] for (uint g6 = 0; g6 < GQ; g6++) {
+        M[g6] = red_sh[g6 * WG_SIZE];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll] for (uint g7 = 0; g7 < GQ; g7++) {
+        const float p = s[g7] <= NEG_INF_SCORE ? 0.0f : exp(s[g7] - M[g7]);
+        p_sh[g7 * WG_SIZE + tid] = p;
+        red_sh[g7 * WG_SIZE + tid] = p;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint h2 = WG_SIZE / 2; h2 > 0; h2 /= 2) {
+        if (tid < h2) {
+            [unroll] for (uint g8 = 0; g8 < GQ; g8++) {
+                red_sh[g8 * WG_SIZE + tid] += red_sh[g8 * WG_SIZE + tid + h2];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float S[GQ];
+    [unroll] for (uint g9 = 0; g9 < GQ; g9++) {
+        S[g9] = red_sh[g9 * WG_SIZE];
+    }
+    if (tid == 0) {
+        [unroll] for (uint ga = 0; ga < GQ; ga++) {
+            STORE_F32(tmp, ((t0 + ga) * n_blocks + b) * (DV + 1), S[ga] == 0.0f ? NEG_INF_SCORE : M[ga] + log(S[ga]));
+        }
+    }
+    const uint jn = min(blk_size, n_kv - b * blk_size);
+    // thread tid owns 4 consecutive output elements per step, for every head of the group
+    for (uint d4 = tid; d4 < DV / 4; d4 += WG_SIZE) {
+        float4 acc[GQ];
+        [unroll] for (uint gb = 0; gb < GQ; gb++) {
+            acc[gb] = 0.0f;
+        }
+        for (uint jj = 0; jj < jn; jj++) {
+            float pj[GQ];
+            bool  anyp = false;
+            [unroll] for (uint gc = 0; gc < GQ; gc++) {
+                pj[gc] = p_sh[gc * WG_SIZE + jj];
+                anyp = anyp || pj[gc] != 0.0f;
+            }
+            if (anyp) {
+#if defined(V_BLOCK)
+                const uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
+#else
+                const uint vj = v_base + (b * blk_size + jj) * stride_v1;
+#endif
+                const float4 vv = load_v4(vj + 4 * d4);
+                [unroll] for (uint gd = 0; gd < GQ; gd++) {
+                    acc[gd] += pj[gd] * vv;
+                }
+            }
+        }
+        [unroll] for (uint ge = 0; ge < GQ; ge++) {
+            if (S[ge] != 0.0f) {
+                const uint  base = ((t0 + ge) * n_blocks + b) * (DV + 1);
+                const float4 o   = acc[ge] / S[ge];
+                STORE_F32(tmp, base + 1 + 4 * d4, o.x);
+                STORE_F32(tmp, base + 2 + 4 * d4, o.y);
+                STORE_F32(tmp, base + 3 + 4 * d4, o.z);
+                STORE_F32(tmp, base + 4 + 4 * d4, o.w);
+            }
+        }
+    }
+}
 #else
 // DECODE: pass 1 with one workgroup per (output row, block of WG_SIZE KV entries), for few query rows. Thread
 // j scores KV entry j, then thread d sums the softmax-weighted values of output element d. Same tmp layout.

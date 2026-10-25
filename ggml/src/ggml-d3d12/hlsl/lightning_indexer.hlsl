@@ -125,13 +125,24 @@ void main(uint3 gid : SV_DispatchThreadID) {
     const uint q_pos = offset_q + t * stride_q2 + s * stride_q3;
 
     float score = 0.0f;
-    for (uint h = 0; h < n_head; h++) {
-        const uint q_row = q_pos + h * stride_q1;
-        float qk = 0.0f;
-        for (uint e = 0; e < n_embd; e++) {
-            qk += LOAD_F32(q_buf, q_row + e) * KVAL(k_row, e);
+    for (uint h0 = 0; h0 < n_head; h0 += 8) {
+        float qk[8];
+        [unroll] for (uint j = 0; j < 8; j++) {
+            qk[j] = 0.0f;
         }
-        score += max(qk, 0.0f) * LOAD_F32(w_buf, w_row + h);
+        for (uint e = 0; e < n_embd; e++) {
+            const float kv = KVAL(k_row, e);   // dequantized once for the 8 heads
+            [unroll] for (uint j = 0; j < 8; j++) {
+                if (h0 + j < n_head) {
+                    qk[j] += LOAD_F32(q_buf, q_pos + (h0 + j) * stride_q1 + e) * kv;
+                }
+            }
+        }
+        [unroll] for (uint j = 0; j < 8; j++) {
+            if (h0 + j < n_head) {
+                score += max(qk[j], 0.0f) * LOAD_F32(w_buf, w_row + h0 + j);
+            }
+        }
     }
     const uint m_row = offset_m + t * stride_m1 + (s % m_streams) * stride_m3;
     STORE_F32(dst, offset_dst + t * stride_d1 + s * stride_d3 + ik, score + LOAD_F16(m_buf, m_row + ik));
