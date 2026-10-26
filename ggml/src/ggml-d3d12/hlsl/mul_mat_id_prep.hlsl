@@ -3,13 +3,15 @@
 // Groups the (token, slot) pairs of a mul_mat_id by expert, for the tiled kernel (mul_mat_tiled.hlsl, MMID).
 // One workgroup. Output in scratch, in uints:
 //   [0]                     number of tiles
-//   [1 + 3 t .. 3 + 3 t]    tile t: expert, first list entry, column count (1..32)
+//   [1 + 3 t .. 3 + 3 t]    tile t: expert, first list entry, column count (1..32); the pairs whose id is -1 (skipped slots,
+//                           upstream #26631) form the last tiles, with expert = SKIP_TILE (the kernel stores zeros for them)
 //   [list_base + i]         pair index token * n_used + slot, grouped by expert
 // Like the list that mm_ids_helper makes in the CUDA backend. The order inside an expert is not fixed;
 // every column is computed on its own, so the result does not depend on it.
 
 #define MAX_EXPERTS 1024
 #define COLS_PER_TILE 32
+#define SKIP_TILE 0x80000000u
 
 RWByteAddressBuffer ids     : register(u0);
 RWByteAddressBuffer scratch : register(u1);
@@ -26,6 +28,8 @@ cbuffer Params : register(b0) {
 
 groupshared uint counts[MAX_EXPERTS];
 groupshared uint starts[MAX_EXPERTS];
+groupshared uint skip_count;
+groupshared uint skip_start;
 
 [numthreads(WG_SIZE, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID) {
@@ -35,12 +39,17 @@ void main(uint3 gtid : SV_GroupThreadID) {
     for (uint e = tid; e < n_experts; e += WG_SIZE) {
         counts[e] = 0;
     }
+    if (tid == 0) {
+        skip_count = 0;
+    }
     GroupMemoryBarrierWithGroupSync();
 
     for (uint p = tid; p < n_pairs; p += WG_SIZE) {
-        const uint e = (uint) ids.Load((offset_ids + (p / n_used) * ids_s1 + p % n_used) * 4);
-        if (e < n_experts) {
-            InterlockedAdd(counts[e], 1u);
+        const int ei = (int) ids.Load((offset_ids + (p / n_used) * ids_s1 + p % n_used) * 4);
+        if (ei < 0) {
+            InterlockedAdd(skip_count, 1u);
+        } else if ((uint) ei < n_experts) {
+            InterlockedAdd(counts[ei], 1u);
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -58,15 +67,24 @@ void main(uint3 gtid : SV_GroupThreadID) {
             }
             pos += c;
         }
+        skip_start = pos;
+        for (uint c0 = 0; c0 < skip_count; c0 += COLS_PER_TILE) {
+            scratch.Store3((1 + 3 * tiles) * 4, uint3(SKIP_TILE, pos + c0, min(skip_count - c0, (uint) COLS_PER_TILE)));
+            tiles++;
+        }
         scratch.Store(0, tiles);
     }
     GroupMemoryBarrierWithGroupSync();
 
     for (uint p2 = tid; p2 < n_pairs; p2 += WG_SIZE) {
-        const uint e = (uint) ids.Load((offset_ids + (p2 / n_used) * ids_s1 + p2 % n_used) * 4);
-        if (e < n_experts) {
+        const int ei = (int) ids.Load((offset_ids + (p2 / n_used) * ids_s1 + p2 % n_used) * 4);
+        if (ei < 0) {
             uint slot;
-            InterlockedAdd(starts[e], 1u, slot);
+            InterlockedAdd(skip_start, 1u, slot);
+            scratch.Store((list_base + slot) * 4, p2);
+        } else if ((uint) ei < n_experts) {
+            uint slot;
+            InterlockedAdd(starts[ei], 1u, slot);
             scratch.Store((list_base + slot) * 4, p2);
         }
     }

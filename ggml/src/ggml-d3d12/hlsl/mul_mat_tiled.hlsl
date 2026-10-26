@@ -924,7 +924,8 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 #else
     const uint k_end   = active ? k : 0;
 #endif
-    const uint a_batch = offset_src0 + tile.x * stride_02;
+    const bool skip_tile = (tile.x & 0x80000000u) != 0;   // pairs with id -1 (upstream #26631): computed on expert 0, stored as zero
+    const uint a_batch = offset_src0 + (tile.x & 0x7fffffffu) * stride_02;
     const uint n_cols  = tile.z;
     const bool b_ok    = b_col < n_cols;
     uint       b_base  = 0;
@@ -1033,7 +1034,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             const uint j = tx * REG_N + in4;
             if (j < n_cols) {
                 const uint pair = scratch.Load((list_base + tile.y + j) * 4);
-                STORE_F32(dst, offset_dst + (pair % n_used) * dst_s1 + (pair / n_used) * dst_s2 + r, acc[im4][in4]);
+                STORE_F32(dst, offset_dst + (pair % n_used) * dst_s1 + (pair / n_used) * dst_s2 + r, skip_tile ? 0.0f : acc[im4][in4]);
             }
 #else
             const uint c = col0 + tx * REG_N + in4;
