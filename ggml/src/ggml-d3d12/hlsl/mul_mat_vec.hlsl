@@ -144,7 +144,9 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint pair      = in_range ? pair_raw : 0;
     const uint id_slot   = pair % n_used;
     const uint token     = pair / n_used;
-    const uint expert    = (uint) ids.Load((offset_ids + token * ids_s1 + id_slot) * 4);
+    const int  expert_i  = (int) ids.Load((offset_ids + token * ids_s1 + id_slot) * 4);
+    const bool skipped   = expert_i < 0;   // an id of -1 skips the slot: its dst row is zero (upstream #26631)
+    const uint expert    = skipped ? 0u : (uint) expert_i;
     const uint ncols     = 1;
     const uint src0_base = o_src0 + expert * s02 + row * s01;
     uint src1_base[MAX_COLS];
@@ -212,7 +214,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 #endif
 #if defined(MMID)
     if (lane == 0 && row < mrows && in_range) {
-        STORE_F32(dst_0, o_dst + token * dst_s2 + id_slot * dst_s1 + row, row_result[0]);
+        STORE_F32(dst_0, o_dst + token * dst_s2 + id_slot * dst_s1 + row, skipped ? 0.0f : row_result[0]);
     }
     return;
 }

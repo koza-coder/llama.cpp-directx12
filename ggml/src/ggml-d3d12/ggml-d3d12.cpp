@@ -1858,7 +1858,7 @@ static bool ggml_d3d12_mul_mat_id_tiled(d3d12_device_ctx & dev, ggml_tensor * as
         return false;
     }
     const uint32_t n_pairs   = n_used * n_tokens;
-    const uint32_t max_tiles = CEIL_DIV(n_pairs, 32u) + std::min(n_experts, n_pairs);
+    const uint32_t max_tiles = CEIL_DIV(n_pairs, 32u) + std::min(n_experts + 1, n_pairs);
     const uint32_t list_base = 1 + 3 * max_tiles;
     const size_t   need      = (size_t) (list_base + n_pairs) * 4;
     if (!dev.collecting && need > dev.mmid_scratch_size) {

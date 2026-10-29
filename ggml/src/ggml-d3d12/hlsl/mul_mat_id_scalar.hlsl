@@ -64,7 +64,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
     i /= m;
     const uint slot = i % n_used;
     const uint tok  = i / n_used;
-    const uint expert = (uint) ids.Load((offset_ids + tok * ids_s1 + slot) * 4);
+    const int  expert_i = (int) ids.Load((offset_ids + tok * ids_s1 + slot) * 4);
+    const bool skipped  = expert_i < 0;   // an id of -1 skips the slot: its dst row is zero (upstream #26631)
+    const uint expert   = skipped ? 0u : (uint) expert_i;
 
     const uint a_base = offset_src0 + expert * stride_02 + row * stride_01;
     const uint b_base = offset_src1 + tok * stride_12 + (slot % b_ne1) * stride_11;
@@ -72,5 +74,5 @@ void main(uint3 gid : SV_DispatchThreadID) {
     for (uint x = 0; x < k; x++) {
         sum += load_a(a_base + x) * load_b(b_base + x);
     }
-    STORE_F32(dst, offset_dst + tok * dst_s2 + slot * dst_s1 + row, sum);
+    STORE_F32(dst, offset_dst + tok * dst_s2 + slot * dst_s1 + row, skipped ? 0.0f : sum);
 }

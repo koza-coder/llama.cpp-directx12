@@ -35,6 +35,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     const uint i0 = i % ne0;
     const int  id = LOAD_I32(ids, offset_ids + i2 * stride_ids1 + i1);
     const float a = LOAD_F32(src0, offset_src0 + i2 * stride_src02 + i1 * stride_src01 + i0);
-    const float b = LOAD_F32(src1, offset_src1 + (uint) id * stride_src11 + i0);
+    // an id of -1 adds nothing (upstream #26631)
+    const float b = id < 0 ? 0.0f : LOAD_F32(src1, offset_src1 + (uint) id * stride_src11 + i0);
     STORE_F32(dst, offset_dst + i2 * stride_dst2 + i1 * stride_dst1 + i0, a + b);
 }
