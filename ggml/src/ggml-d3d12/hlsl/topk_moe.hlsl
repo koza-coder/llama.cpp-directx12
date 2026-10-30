@@ -3,11 +3,15 @@
 // MoE router in one pass (softmax -> top-k -> get_rows [-> sum, clamp, div]), one workgroup per token:
 //   ids[t][0..k)     = indices of the k largest softmax probs, descending (lowest index first on ties)
 //   weights[t][0..k) = their probs, divided by clamp(sum, clamp_min, clamp_max) with NORM
-// defines: NORM
+// defines: NORM, SIGMOID (probs = sigmoid(logits) instead of softmax; with it the experts are chosen by probs + bias[e],
+// the weights stay the unbiased probs - upstream TOPK_MOE_SIGMOID_NORM_BIAS)
 
 RWByteAddressBuffer logits  : register(u0);
 RWByteAddressBuffer ids     : register(u1);
 RWByteAddressBuffer weights : register(u2);
+#if defined(SIGMOID)
+RWByteAddressBuffer bias    : register(u3);
+#endif
 
 cbuffer Params : register(b0) {
     uint  offset_logits;
@@ -21,12 +25,16 @@ cbuffer Params : register(b0) {
     uint  n_tokens;
     float clamp_min;
     float clamp_max;
+    uint  offset_bias;
     uint  nwg_x;
 };
 
 #define MAX_EXPERT 1024
 
 groupshared float p_sh[MAX_EXPERT];
+#if defined(SIGMOID)
+groupshared float sel_sh[MAX_EXPERT];   // selection value: prob + bias
+#endif
 groupshared float red_v[WG_SIZE];
 groupshared uint  red_i[WG_SIZE];
 
@@ -39,6 +47,14 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     }
     const uint base = offset_logits + t * stride_logits;
 
+#if defined(SIGMOID)
+    for (uint e = tid; e < n_expert; e += WG_SIZE) {
+        const float p = 1.0f / (1.0f + exp(-LOAD_F32(logits, base + e)));
+        p_sh[e]   = p;
+        sel_sh[e] = p + LOAD_F32(bias, offset_bias + e);
+    }
+    GroupMemoryBarrierWithGroupSync();
+#else
     // softmax: max, then exp and sum
     float m = -3.4028235e38f;
     for (uint e = tid; e < n_expert; e += WG_SIZE) {
@@ -76,14 +92,19 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         p_sh[e2] *= inv;
     }
     GroupMemoryBarrierWithGroupSync();
+#endif
 
     // top-k: k rounds of argmax; the winner is marked taken with -1 (probs are >= 0)
     float wsum = 0.0f;
     for (uint k = 0; k < n_used; k++) {
-        float bv = -2.0f;
+        float bv = -3.4028235e38f;
         uint  bi = 0xFFFFFFFFu;
         for (uint e3 = tid; e3 < n_expert; e3 += WG_SIZE) {
+#if defined(SIGMOID)
+            const float v = sel_sh[e3];
+#else
             const float v = p_sh[e3];
+#endif
             if (v > bv) {   // ascending e per thread: the first (lowest) index wins a tie
                 bv = v;
                 bi = e3;
@@ -103,12 +124,20 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             }
             GroupMemoryBarrierWithGroupSync();
         }
-        const float wv = red_v[0];
         const uint  wi = red_i[0];
+#if defined(SIGMOID)
+        const float wv = p_sh[wi];
+#else
+        const float wv = red_v[0];
+#endif
         if (tid == 0) {
             STORE_I32(ids, offset_ids + t * stride_ids + k, (int) wi);
             STORE_F32(weights, offset_weights + t * stride_weights + k, wv);
+#if defined(SIGMOID)
+            sel_sh[wi] = -3.4028235e38f;
+#else
             p_sh[wi] = -1.0f;
+#endif
         }
         wsum += wv;
         GroupMemoryBarrierWithGroupSync();
