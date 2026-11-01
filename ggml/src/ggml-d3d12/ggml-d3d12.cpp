@@ -1539,12 +1539,28 @@ static bool ggml_d3d12_mul_mat_vec_type(ggml_type t) {
     }
 }
 
+// exp838: IQ lookup tables in groupshared for the matvec kernel - on by default on Moore Threads, GGML_D3D12_IQ_GS 0 / 1 forces it
+static bool ggml_d3d12_iq_gs(const d3d12_device_ctx & dev, ggml_type t) {
+    static const char * env = getenv("GGML_D3D12_IQ_GS");
+    const bool on = env ? atoi(env) != 0 : dev.vendor_id == 0x1ED5;
+    return on && (t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ2_XXS ||
+                  t == GGML_TYPE_IQ2_XS || t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ4_NL);
+}
+
 // one matrix of a fused mul_mat_vec dispatch: dst = src0 * src1 (+ add, broadcast like ggml_add)
 struct d3d12_mat_slot {
     ggml_tensor * src0;
     ggml_tensor * dst;   // the MUL_MAT node, or the fused ADD node
     ggml_tensor * add;   // addend of the fused ADD, or null
 };
+
+// exp848: tiled prompt kernel, grid IQ types decoded by 4 threads per row - on by default on Moore Threads, GGML_D3D12_IQ_SPLIT 0 / 1 forces it
+static bool ggml_d3d12_iq_split(const d3d12_device_ctx & dev, ggml_type t) {
+    static const char * env = getenv("GGML_D3D12_IQ_SPLIT");
+    const bool on = env ? atoi(env) != 0 : dev.vendor_id == 0x1ED5;
+    return on && (t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ2_XXS ||
+                  t == GGML_TYPE_IQ2_XS || t == GGML_TYPE_IQ1_S);
+}
 
 // types the tiled prompt kernel dequantizes (mul_mat_tiled.hlsl)
 static bool ggml_d3d12_tiled_type(ggml_type t) {
@@ -1635,9 +1651,12 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
 #ifdef GGML_D3D12_BT_DP4A
     dp4a_ok = dev.vendor_id != 0x1ED5 && dev.caps.shader_model >= D3D_SHADER_MODEL_6_4;
 #endif
+    // exp832: without DP4a (Moore Threads) Q4_K / Q6_K take the fp32 big tile (GGML_D3D12_BT_KQ 0 / 1 forces it)
+    static const char * kq_env = getenv("GGML_D3D12_BT_KQ");
+    const bool kq_fp32 = !dp4a_ok && (kq_env ? atoi(kq_env) != 0 : dev.vendor_id == 0x1ED5);
     const bool big = bt_on && dst->ne[1] >= bt_tn &&
                      (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 ||
-                      (dp4a_ok && bt_wide && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K)));
+                      ((dp4a_ok && bt_wide) || kq_fp32) && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K));
     bool use_dp4a = false;
     if (big) {
         defines.push_back("BIG_TILE");
@@ -1671,6 +1690,9 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
 #endif
         }
 #endif
+    }
+    if (!big && ggml_d3d12_iq_split(dev, src0->type)) {
+        defines.push_back("IQ_SPLIT_ON");   // exp848
     }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines,
                                                         use_dp4a ? D3D_SHADER_MODEL_6_4 : D3D_SHADER_MODEL_6_0);
@@ -1774,7 +1796,7 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     // 2..15 columns of types without the MULTI_COL kernel run as single-column dispatches instead (108 ms).
     // GGML_D3D12_MV_PERCOL=N sets the column limit on any GPU (0 = off).
     static const int percol_env = [] { const char * e = getenv("GGML_D3D12_MV_PERCOL"); return e ? atoi(e) : -1; }();
-    const uint32_t percol_max = percol_env >= 0 ? (uint32_t) percol_env : (dev.vendor_id == 0x1ED5 ? 15u : 0u);
+    const uint32_t percol_max = percol_env >= 0 ? (uint32_t) percol_env : 15u;   // exp850: all GPUs (RX R9700 3.3-3.5x at 4-8 tokens, exp845)
     const bool     mc_type  = (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && dev.mv_multi;
     const bool     per_col  = mats[0].dst->ne[1] > 1 && (uint32_t) mats[0].dst->ne[1] <= percol_max && !mc_type;
     const bool     one_col  = (mats[0].dst->ne[1] == 1 || per_col) && src0->type != GGML_TYPE_F32;
@@ -1799,6 +1821,9 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     }
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
+    }
+    if (ggml_d3d12_iq_gs(dev, src0->type)) {
+        defines.push_back("IQ_GS");
     }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_vec", hlsl_mul_mat_vec, defines);
     const uint32_t rows_per_wg = D3D12_WG_SIZE / tpr;
@@ -1896,7 +1921,11 @@ static bool ggml_d3d12_mul_mat_id_tiled(d3d12_device_ctx & dev, ggml_tensor * as
     for (auto & ch : define) {
         ch = (char) toupper((unsigned char) ch);
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, { define, "MMID" });
+    std::vector<std::string> tdefs = { define, "MMID" };
+    if (ggml_d3d12_iq_split(dev, as->type)) {
+        tdefs.push_back("IQ_SPLIT_ON");   // exp848
+    }
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, tdefs);
 
     const d3d12_binding b0 = ggml_d3d12_bind_tensor(as);
     const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
@@ -1958,6 +1987,9 @@ static void ggml_d3d12_mul_mat_id(d3d12_device_ctx & dev, ggml_tensor * as, ggml
         return;
     }
     std::vector<std::string> defines = { define, "TPR=" + std::to_string(tpr), "N_MATS=1", "MMID" };
+    if (ggml_d3d12_iq_gs(dev, as->type)) {
+        defines.push_back("IQ_GS");
+    }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_vec", hlsl_mul_mat_vec, defines);
 
     const d3d12_binding b0 = ggml_d3d12_bind_tensor(as);
@@ -5607,7 +5639,7 @@ static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t gg
     if (const char * env = getenv("GGML_D3D12_MM_TPR")) {
         dev.mm_tpr_max = (uint32_t) std::max(1, atoi(env));
     } else if (dev.vendor_id == 0x1ED5) {
-        dev.mm_tpr_max = 32; // exp568: decode (tg64) +20.7 % on the S80 (wave 128: fewer partial sums to reduce)
+        dev.mm_tpr_max = 8; // exp857: 8 beats exp568's 32 on the S80 (exp853 Qwen3.8 IQ3_XXS tg32 +9.3 %, exp856 Q4_K_M +2.8 %, MoE +1.5 %)
     } else if (dev.vendor_id == 0x8086) {
         dev.mm_tpr_max = 4; // exp589/591/597: Intel Iris Xe decode (tg64) +70-87 % with 4 threads per row
     }

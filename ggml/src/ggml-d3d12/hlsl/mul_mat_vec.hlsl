@@ -112,6 +112,10 @@ float load_src1(uint i) {
 [numthreads(WG_SIZE, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint tid       = gtid.x;
+#if defined(IQ_GS)
+    iq_gs_load(tid, WG_SIZE);   // exp838: lookup tables into groupshared (see dequant_row.hlsli)
+    GroupMemoryBarrierWithGroupSync();
+#endif
     const uint lane      = tid % TPR;
     const uint wg_linear = gid.y * nwg_x + gid.x;
 
