@@ -15,6 +15,11 @@
 #define MAX_COLS 4
 
 #define ROWS (WG_SIZE / TPR)
+#if defined(RPT2)
+#define ROW_SPAN (2 * ROWS)   // exp861: each thread also computes row + ROWS
+#else
+#define ROW_SPAN ROWS
+#endif
 
 RWByteAddressBuffer src1   : register(u0);
 RWByteAddressBuffer src0_0 : register(u1);
@@ -81,6 +86,9 @@ cbuffer Params : register(b0) {
 
 #if TPR > 1
 groupshared float partial[MAX_COLS][WG_SIZE];
+#if defined(RPT2)
+groupshared float partial2[WG_SIZE];
+#endif
 #endif
 
 // src1 columns are f32 unless SRC1_F16 is set (the vision tower multiplies two f16 tensors)
@@ -112,6 +120,10 @@ float load_src1(uint i) {
 [numthreads(WG_SIZE, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint tid       = gtid.x;
+#if defined(IQ_GS)
+    iq_gs_load(tid, WG_SIZE);   // exp838: lookup tables into groupshared (see dequant_row.hlsli)
+    GroupMemoryBarrierWithGroupSync();
+#endif
     const uint lane      = tid % TPR;
     const uint wg_linear = gid.y * nwg_x + gid.x;
 
@@ -132,8 +144,8 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     if (mat == 2) SELECT_MAT(2);
 #endif
 
-    const uint row_groups = (mrows + ROWS - 1) / ROWS;
-    const uint row        = (wg_local % row_groups) * ROWS + tid / TPR;
+    const uint row_groups = (mrows + ROW_SPAN - 1) / ROW_SPAN;
+    const uint row        = (wg_local % row_groups) * ROW_SPAN + tid / TPR;
 #if defined(MMID)
     // one (id slot, token) pair per group of row groups; the id picks the expert matrix
     // the 2D fold rounds the group count up; the extra groups have no token. Keep them in range and drop
@@ -164,7 +176,9 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint src02_idx = dst2_idx / broadcast2;
     const uint src03_idx = dst3_idx / broadcast3;
 
-#if defined(ONE_COL) && !defined(MULTI_COL)
+#if defined(NCOLS)
+    const uint ncols     = NCOLS;   // exp872: one dispatch for NCOLS columns, weights decoded once
+#elif defined(ONE_COL) && !defined(MULTI_COL)
     const uint ncols     = 1;
 #else
     const uint ncols     = min(MAX_COLS, n - col0);
@@ -176,6 +190,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     }
 #endif
     float acc[MAX_COLS] = { 0, 0, 0, 0 };
+#if defined(RPT2)
+    float acc2[MAX_COLS] = { 0, 0, 0, 0 };
+    const uint row2       = row + ROWS;
+    const uint src0_base2 = src0_base + ROWS * s01;
+#endif
 
     if (row < mrows) {
         if (mat == 0) {
@@ -192,25 +211,54 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
 #endif
     }
+#if defined(RPT2)
+    if (row2 < mrows) {
+        if (mat == 0) {
+            dot_row(src0_0, src0_base2, lane, ncols, src1_base, acc2);
+        }
+#if N_MATS >= 2
+        else if (mat == 1) {
+            dot_row(src0_1, src0_base2, lane, ncols, src1_base, acc2);
+        }
+#endif
+#if N_MATS >= 3
+        else {
+            dot_row(src0_2, src0_base2, lane, ncols, src1_base, acc2);
+        }
+#endif
+    }
+#endif
 
 #if TPR > 1
     // tree reduction inside each TPR block
     [unroll] for (uint c2 = 0; c2 < MAX_COLS; c2++) {
         partial[c2][tid] = acc[c2];
     }
+#if defined(RPT2)
+    partial2[tid] = acc2[0];
+#endif
     GroupMemoryBarrierWithGroupSync();
     for (uint off = TPR / 2; off > 0; off /= 2) {
         if (lane < off) {
             [unroll] for (uint c3 = 0; c3 < MAX_COLS; c3++) {
                 partial[c3][tid] += partial[c3][tid + off];
             }
+#if defined(RPT2)
+            partial2[tid] += partial2[tid + off];
+#endif
         }
         GroupMemoryBarrierWithGroupSync();
     }
     const float4 row_result = float4(partial[0][tid], partial[1][tid], partial[2][tid], partial[3][tid]);
+#if defined(RPT2)
+    const float  row_result2 = partial2[tid];
+#endif
 #else
     // one thread per row: no shared memory and no barriers
     const float4 row_result = float4(acc[0], acc[1], acc[2], acc[3]);
+#if defined(RPT2)
+    const float  row_result2 = acc2[0];
+#endif
 #endif
 #if defined(MMID)
     if (lane == 0 && row < mrows && in_range) {
@@ -258,5 +306,23 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 #endif
         }
     }
+#if defined(RPT2)
+    if (lane == 0 && row2 < mrows) {
+        const uint dst_idx2 = o_dst + dst3_idx * (mrows * n * batches2) + dst2_idx * (mrows * n) + col0 * mrows + row2;
+        if (mat == 0) {
+            STORE_F32(dst_0, dst_idx2, row_result2);
+        }
+#if N_MATS >= 2
+        else if (mat == 1) {
+            STORE_F32(dst_1, dst_idx2, row_result2);
+        }
+#endif
+#if N_MATS >= 3
+        else {
+            STORE_F32(dst_2, dst_idx2, row_result2);
+        }
+#endif
+    }
+#endif
 }
 #endif

@@ -326,6 +326,7 @@ struct d3d12_device_ctx {
     std::vector<std::string> dispatch_names;
     bool     no_fuse          = false; // GGML_D3D12_NO_FUSE: encode every node on its own, for bisecting
     uint32_t mm_tpr_max       = D3D12_WG_SIZE; // GGML_D3D12_MM_TPR: cap on matvec threads per row (1 = no reduction tree)
+    uint32_t mm_tpr_iq        = 0;             // exp867: lower cap for IQ types (0 = mm_tpr_max)
     uint32_t tiled_min_cols   = GGML_D3D12_TILED_DEFAULT; // GGML_D3D12_TILED: columns from which the tiled kernels are used (0 = never)
     uint32_t tiled_mmid_min_cols = GGML_D3D12_TILED_MMID_DEFAULT; // GGML_D3D12_TILED_MMID: same for MUL_MAT_ID (exp361)
     bool     mv_multi         = GGML_D3D12_MV_MULTI_DEFAULT != 0; // GGML_D3D12_MV_MULTI (exp361)
@@ -1539,12 +1540,28 @@ static bool ggml_d3d12_mul_mat_vec_type(ggml_type t) {
     }
 }
 
+// exp838: IQ lookup tables in groupshared for the matvec kernel - on by default on Moore Threads, GGML_D3D12_IQ_GS 0 / 1 forces it
+static bool ggml_d3d12_iq_gs(const d3d12_device_ctx & dev, ggml_type t) {
+    static const char * env = getenv("GGML_D3D12_IQ_GS");
+    const bool on = env ? atoi(env) != 0 : dev.vendor_id == 0x1ED5;
+    return on && (t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ2_XXS ||
+                  t == GGML_TYPE_IQ2_XS || t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ4_NL);
+}
+
 // one matrix of a fused mul_mat_vec dispatch: dst = src0 * src1 (+ add, broadcast like ggml_add)
 struct d3d12_mat_slot {
     ggml_tensor * src0;
     ggml_tensor * dst;   // the MUL_MAT node, or the fused ADD node
     ggml_tensor * add;   // addend of the fused ADD, or null
 };
+
+// exp848: tiled prompt kernel, grid IQ types decoded by 4 threads per row - on by default on Moore Threads, GGML_D3D12_IQ_SPLIT 0 / 1 forces it
+static bool ggml_d3d12_iq_split(const d3d12_device_ctx & dev, ggml_type t) {
+    static const char * env = getenv("GGML_D3D12_IQ_SPLIT");
+    const bool on = env ? atoi(env) != 0 : dev.vendor_id == 0x1ED5;
+    return on && (t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ2_XXS ||
+                  t == GGML_TYPE_IQ2_XS || t == GGML_TYPE_IQ1_S);
+}
 
 // types the tiled prompt kernel dequantizes (mul_mat_tiled.hlsl)
 static bool ggml_d3d12_tiled_type(ggml_type t) {
@@ -1635,9 +1652,12 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
 #ifdef GGML_D3D12_BT_DP4A
     dp4a_ok = dev.vendor_id != 0x1ED5 && dev.caps.shader_model >= D3D_SHADER_MODEL_6_4;
 #endif
+    // exp832: without DP4a (Moore Threads) Q4_K / Q6_K take the fp32 big tile (GGML_D3D12_BT_KQ 0 / 1 forces it)
+    static const char * kq_env = getenv("GGML_D3D12_BT_KQ");
+    const bool kq_fp32 = !dp4a_ok && (kq_env ? atoi(kq_env) != 0 : dev.vendor_id == 0x1ED5);
     const bool big = bt_on && dst->ne[1] >= bt_tn &&
                      (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 ||
-                      (dp4a_ok && bt_wide && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K)));
+                      ((dp4a_ok && bt_wide) || kq_fp32) && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K));
     bool use_dp4a = false;
     if (big) {
         defines.push_back("BIG_TILE");
@@ -1671,6 +1691,9 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
 #endif
         }
 #endif
+    }
+    if (!big && ggml_d3d12_iq_split(dev, src0->type)) {
+        defines.push_back("IQ_SPLIT_ON");   // exp848
     }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines,
                                                         use_dp4a ? D3D_SHADER_MODEL_6_4 : D3D_SHADER_MODEL_6_0);
@@ -1730,7 +1753,13 @@ static void ggml_d3d12_mul_mat_scalar(d3d12_device_ctx & dev, ggml_tensor * src0
 }
 
 // decode matvec threads per row cap (see dev.mm_tpr_max); Moore Threads uses 8 for rows of K 3584..4096 (K/32 112..128), exp600
-static uint32_t ggml_d3d12_tpr_cap(const d3d12_device_ctx & dev, uint32_t units) {
+static uint32_t ggml_d3d12_tpr_cap(const d3d12_device_ctx & dev, uint32_t units, ggml_type t) {
+    const bool iq = t == GGML_TYPE_IQ1_S || t == GGML_TYPE_IQ1_M || t == GGML_TYPE_IQ2_XXS || t == GGML_TYPE_IQ2_XS ||
+                    t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_NL ||
+                    t == GGML_TYPE_IQ4_XS;
+    if (iq && dev.mm_tpr_iq != 0) {
+        return std::min(dev.mm_tpr_iq, dev.mm_tpr_max);   // exp867
+    }
     return (dev.vendor_id == 0x1ED5 && units >= 112 && units <= 128 && dev.mm_tpr_max == 32) ? 8u : dev.mm_tpr_max;
 }
 
@@ -1760,7 +1789,7 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     // threads per row: one unit of work (4 floats or one 32-wide block) per thread, power of two, at most WG_SIZE
     const uint32_t units = (uint32_t) (ggml_is_quantized(src0->type) ? src0->ne[0] / 32 : src0->ne[0] / 4);
     uint32_t       tpr   = 1;
-    while (tpr < units && tpr < D3D12_WG_SIZE && tpr < ggml_d3d12_tpr_cap(dev, units)) {
+    while (tpr < units && tpr < D3D12_WG_SIZE && tpr < ggml_d3d12_tpr_cap(dev, units, src0->type)) {
         tpr *= 2;
     }
     bool fuse_add = false;
@@ -1774,11 +1803,20 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     // 2..15 columns of types without the MULTI_COL kernel run as single-column dispatches instead (108 ms).
     // GGML_D3D12_MV_PERCOL=N sets the column limit on any GPU (0 = off).
     static const int percol_env = [] { const char * e = getenv("GGML_D3D12_MV_PERCOL"); return e ? atoi(e) : -1; }();
-    const uint32_t percol_max = percol_env >= 0 ? (uint32_t) percol_env : (dev.vendor_id == 0x1ED5 ? 15u : 0u);
+    const uint32_t percol_max = percol_env >= 0 ? (uint32_t) percol_env : 15u;   // exp850: all GPUs (RX R9700 3.3-3.5x at 4-8 tokens, exp845)
     const bool     mc_type  = (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && dev.mv_multi;
     const bool     per_col  = mats[0].dst->ne[1] > 1 && (uint32_t) mats[0].dst->ne[1] <= percol_max && !mc_type;
     const bool     one_col  = (mats[0].dst->ne[1] == 1 || per_col) && src0->type != GGML_TYPE_F32;
-    const uint32_t max_cols = one_col ? 1 : 4;
+    // exp872: 2..4 columns of IQ3 types in one dispatch, each weight decoded once for every column (MTP verify batches);
+    // GGML_D3D12_MV_NC=0 turns it off
+    static const int nc_env = [] { const char * e = getenv("GGML_D3D12_MV_NC"); return e ? atoi(e) : 1; }();
+    const uint32_t ncols_fixed = nc_env != 0 && per_col && mats[0].dst->ne[1] <= 4 && src1->type == GGML_TYPE_F32 &&
+                                 (src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ3_S ||
+                                  // exp875: the generated column-loop copies of the other single-column kernels
+                                  src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
+                                  src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ2_S ||
+                                  src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS) ? (uint32_t) mats[0].dst->ne[1] : 0u;
+    const uint32_t max_cols = ncols_fixed ? ncols_fixed : one_col ? 1 : 4;
     // exp361: 2..4 columns with the word-window kernels (each weight word decoded once, FMA into up to 4 columns)
     const bool multi_col = dev.mv_multi && !one_col && mats[0].dst->ne[1] > 1 &&
                            (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) &&
@@ -1790,6 +1828,9 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     if (multi_col) {
         defines.push_back("MULTI_COL");
     }
+    if (ncols_fixed) {
+        defines.push_back("NCOLS=" + std::to_string(ncols_fixed));
+    }
     // On the AMD Vega iGPU every N_MATS=2 kernel without FUSE_ADD hung the GPU (DEVICE_HUNG, 2026-09-19); taking
     // the FUSE_ADD variant for groups (add_flag 0 skips the add at run time) avoids it. Why the variant matters is
     // not known. It is not free - about 7% of tg128 on an Intel Iris Xe - so it is limited to AMD integrated GPUs;
@@ -1800,8 +1841,19 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
     }
+    if (ggml_d3d12_iq_gs(dev, src0->type)) {
+        defines.push_back("IQ_GS");
+    }
+    // exp861: GGML_D3D12_MV_RPT=2 -> each thread also computes the row WG_SIZE/tpr further on (Strata-style 2 rows per thread)
+    static const int rpt_env = [] { const char * e = getenv("GGML_D3D12_MV_RPT"); return e ? atoi(e) : 1; }();
+    const bool rpt2 = rpt_env == 2 && one_col && !multi_col && !fuse_add && !ncols_fixed &&
+                      !std::count(defines.begin(), defines.end(), std::string("FUSE_ADD")) &&
+                      (uint32_t) mats[0].dst->ne[0] >= 2 * (D3D12_WG_SIZE / tpr);
+    if (rpt2) {
+        defines.push_back("RPT2");
+    }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_vec", hlsl_mul_mat_vec, defines);
-    const uint32_t rows_per_wg = D3D12_WG_SIZE / tpr;
+    const uint32_t rows_per_wg = (D3D12_WG_SIZE / tpr) * (rpt2 ? 2u : 1u);
 
     const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
     const size_t        t0 = ggml_type_size(src0->type);   // block size in bytes for quant types
@@ -1896,7 +1948,11 @@ static bool ggml_d3d12_mul_mat_id_tiled(d3d12_device_ctx & dev, ggml_tensor * as
     for (auto & ch : define) {
         ch = (char) toupper((unsigned char) ch);
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, { define, "MMID" });
+    std::vector<std::string> tdefs = { define, "MMID" };
+    if (ggml_d3d12_iq_split(dev, as->type)) {
+        tdefs.push_back("IQ_SPLIT_ON");   // exp848
+    }
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, tdefs);
 
     const d3d12_binding b0 = ggml_d3d12_bind_tensor(as);
     const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
@@ -1951,13 +2007,16 @@ static void ggml_d3d12_mul_mat_id(d3d12_device_ctx & dev, ggml_tensor * as, ggml
     }
     const uint32_t units = (uint32_t) (ggml_is_quantized(as->type) ? as->ne[0] / 32 : as->ne[0] / 4);
     uint32_t       tpr   = 1;
-    while (tpr < units && tpr < D3D12_WG_SIZE && tpr < ggml_d3d12_tpr_cap(dev, units)) {
+    while (tpr < units && tpr < D3D12_WG_SIZE && tpr < ggml_d3d12_tpr_cap(dev, units, as->type)) {
         tpr *= 2;
     }
     if (ggml_d3d12_mul_mat_id_tiled(dev, as, src1, ids, dst)) {
         return;
     }
     std::vector<std::string> defines = { define, "TPR=" + std::to_string(tpr), "N_MATS=1", "MMID" };
+    if (ggml_d3d12_iq_gs(dev, as->type)) {
+        defines.push_back("IQ_GS");
+    }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_vec", hlsl_mul_mat_vec, defines);
 
     const d3d12_binding b0 = ggml_d3d12_bind_tensor(as);
@@ -5607,9 +5666,12 @@ static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t gg
     if (const char * env = getenv("GGML_D3D12_MM_TPR")) {
         dev.mm_tpr_max = (uint32_t) std::max(1, atoi(env));
     } else if (dev.vendor_id == 0x1ED5) {
-        dev.mm_tpr_max = 32; // exp568: decode (tg64) +20.7 % on the S80 (wave 128: fewer partial sums to reduce)
+        dev.mm_tpr_max = 8; // exp857: 8 beats exp568's 32 on the S80 (exp853 Qwen3.8 IQ3_XXS tg32 +9.3 %, exp856 Q4_K_M +2.8 %, MoE +1.5 %)
     } else if (dev.vendor_id == 0x8086) {
         dev.mm_tpr_max = 4; // exp589/591/597: Intel Iris Xe decode (tg64) +70-87 % with 4 threads per row
+    } else if (dev.vendor_id == 0x1002 && !dev.caps.uma) {
+        dev.mm_tpr_max = 32; // exp867: RX R9700 Qwen3.5-9B Q4_K_M tg64 +2 % vs 256 (exp864)
+        dev.mm_tpr_iq  = 8;  // exp867: RX R9700 glm-4-9b IQ2_M tg64 79.5 vs 68.0 t/s (exp858)
     }
     if (const char * env = getenv("GGML_D3D12_TILED")) {
         // column count from which the tiled prompt kernel takes over; 1 means "always when eligible"

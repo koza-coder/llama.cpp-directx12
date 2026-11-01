@@ -561,6 +561,67 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             }
 #endif
 #endif
+#elif defined(SRC0_Q4_K)
+            // exp832: elements e0 .. e0 + A_ELEMS - 1 of sub-block s (layout: load_a_row of the 64 x 32 kernel below)
+            const uint blk  = kt / 256;
+            const uint s    = (kt % 256) / 32;
+            const uint base = (a_batch + a_r * stride_01 + blk) * 144;
+            uint w;
+            LOAD_U32_UNALIGNED(src0, base, w);
+            const float d    = f16tof32(w & 0xFFFFu);
+            const float dmin = f16tof32(w >> 16);
+            uint sc0, sc1, sc2;
+            LOAD_U32_UNALIGNED(src0, base + 4, sc0);
+            LOAD_U32_UNALIGNED(src0, base + 8, sc1);
+            LOAD_U32_UNALIGNED(src0, base + 12, sc2);
+            uint sc, mn;
+            if (s < 4) {
+                sc = byte_of(sc0, s) & 63u;
+                mn = byte_of(sc1, s) & 63u;
+            } else {
+                sc = (byte_of(sc2, s - 4) & 0xFu) | ((byte_of(sc0, s - 4) >> 6) << 4);
+                mn = (byte_of(sc2, s - 4) >> 4) | ((byte_of(sc1, s - 4) >> 6) << 4);
+            }
+            const float dl    = d * (float) sc;
+            const float ml    = dmin * (float) mn;
+            const uint  shift = (s & 1u) * 4u;
+            const uint  qbase = base + 16 + 32 * (s / 2) + a_part * A_ELEMS;
+            [unroll] for (uint j = 0; j < A_ELEMS / 4; j++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, qbase + 4 * j, q);
+                [unroll] for (uint b = 0; b < 4; b++) {
+                    vals[j * 4 + b] = dl * (float) ((byte_of(q, b) >> shift) & 0xFu) - ml;
+                }
+            }
+#elif defined(SRC0_Q6_K)
+            // exp832: elements e0 .. e0 + A_ELEMS - 1 of sub-block s; scale d0 for elements 0..15, d1 for 16..31
+            const uint blk  = kt / 256;
+            const uint s    = (kt % 256) / 32;
+            const uint h    = s / 4;
+            const uint t    = s % 4;
+            const uint e0   = a_part * A_ELEMS;
+            const uint base = (a_batch + a_r * stride_01 + blk) * 210;
+            uint dbits;
+            LOAD_U16_UNALIGNED(src0, base + 208, dbits);
+            const float d = f16tof32(dbits);
+            const uint  ql_base = base + 64 * h + 32 * (t & 1u) + e0;
+            const uint  qh_base = base + 128 + 32 * h + e0;
+            const uint  lshift  = (t >> 1) * 4u;
+            const uint  hshift  = t * 2u;
+            uint scw;
+            LOAD_U32_UNALIGNED(src0, base + 192 + 8 * h + 2 * t, scw);
+            const float d0 = d * (float) sbyte_of(scw, 0);
+            const float d1 = d * (float) sbyte_of(scw, 1);
+            [unroll] for (uint j = 0; j < A_ELEMS / 4; j++) {
+                uint ql, qh;
+                LOAD_U32_UNALIGNED(src0, ql_base + 4 * j, ql);
+                LOAD_U32_UNALIGNED(src0, qh_base + 4 * j, qh);
+                const float dsc = (e0 + 4 * j < 16) ? d0 : d1;
+                [unroll] for (uint b = 0; b < 4; b++) {
+                    const int q = (int) (((byte_of(ql, b) >> lshift) & 0xFu) | (((byte_of(qh, b) >> hshift) & 3u) << 4)) - 32;
+                    vals[j * 4 + b] = dsc * (float) q;
+                }
+            }
 #else
             // Q8_0 block: f16 d, 32 int8
             const uint base = (a_batch + a_r * stride_01 + kt / 32) * 34;
@@ -737,6 +798,15 @@ groupshared float Btile[TILE_K][TILE_N];
 #define MAX_COLS 1
 static uint g_row;
 #define ACC(a, kidx) { Atile[(kidx) % TILE_K][g_row] = (a); }
+#if defined(IQ_SPLIT_ON) && (defined(SRC0_IQ3_XXS) || defined(SRC0_IQ3_S) || defined(SRC0_IQ2_S) || defined(SRC0_IQ2_XXS) || \
+                             defined(SRC0_IQ2_XS) || defined(SRC0_IQ1_S))
+// exp848: 4 threads per src0 row, each decodes group g_l (8 values) of the sub-block, so all NTHREADS = 4 * TILE_M threads stage
+#define IQ_SPLIT
+static uint g_l;
+#define IQ_L0 g_l
+#define IQ_L1 (g_l + 1u)
+#define IQ_LUNROLL
+#endif
 #include "dequant_row.hlsli"
 #endif
 
@@ -965,6 +1035,24 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     }
 
     for (uint kt = 0; kt < k_end; kt += TILE_K) {
+#if defined(IQ_SPLIT)
+        {
+            const uint r = row0 + tid / 4;
+            if (r < m) {
+                uint  src1_base[MAX_COLS];
+                float unused[MAX_COLS];
+                src1_base[0] = 0;
+                unused[0]    = 0.0f;
+                g_row        = tid / 4;
+                g_l          = tid % 4;
+                dot_row(src0, a_batch + r * stride_01, kt / 32, 0, src1_base, unused);
+            } else {
+                [unroll] for (uint z = 0; z < 8; z++) {
+                    Atile[(tid % 4) * 8 + z][tid / 4] = 0.0f;
+                }
+            }
+        }
+#else
         if (tid < TILE_M) {
             const uint r = row0 + tid;
 #if defined(TILED_DOT_ROW)
@@ -994,6 +1082,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             }
 #endif
         }
+#endif   // IQ_SPLIT
         [unroll] for (uint i = 0; i < 4; i++) {
             const uint ki = b_part * 4 + i;
             #if defined(K_TAIL)
