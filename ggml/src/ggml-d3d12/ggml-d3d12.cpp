@@ -1770,7 +1770,14 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     // single-column (decode) products skip the per-element column loop (+50% decode on the MTT S80).
     // Not for F32 weights: on the S80 that variant failed MUL_MAT f32 k=256 bs=[3,2] nr=[1,2] (ERR 0.3,
     // deterministic) while F16 and the quant types passed the same shape; cause not found yet.
-    const bool     one_col  = mats[0].dst->ne[1] == 1 && src0->type != GGML_TYPE_F32;
+    // exp796: on the MTT S80 the generic column loop made a 2-token batch of a Q4_K_M 9B cost 5x one token (319 vs 66 ms);
+    // 2..15 columns of types without the MULTI_COL kernel run as single-column dispatches instead (108 ms).
+    // GGML_D3D12_MV_PERCOL=N sets the column limit on any GPU (0 = off).
+    static const int percol_env = [] { const char * e = getenv("GGML_D3D12_MV_PERCOL"); return e ? atoi(e) : -1; }();
+    const uint32_t percol_max = percol_env >= 0 ? (uint32_t) percol_env : (dev.vendor_id == 0x1ED5 ? 15u : 0u);
+    const bool     mc_type  = (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && dev.mv_multi;
+    const bool     per_col  = mats[0].dst->ne[1] > 1 && (uint32_t) mats[0].dst->ne[1] <= percol_max && !mc_type;
+    const bool     one_col  = (mats[0].dst->ne[1] == 1 || per_col) && src0->type != GGML_TYPE_F32;
     const uint32_t max_cols = one_col ? 1 : 4;
     // exp361: 2..4 columns with the word-window kernels (each weight word decoded once, FMA into up to 4 columns)
     const bool multi_col = dev.mv_multi && !one_col && mats[0].dst->ne[1] > 1 &&
@@ -4090,10 +4097,54 @@ static int ggml_d3d12_encode_topk_moe(d3d12_device_ctx & dev, const ggml_cgraph 
     const d3d12_binding bw = ggml_d3d12_bind_tensor(weights);
     const std::vector<uint32_t> params = {
         bl.elem_offset, bi.elem_offset, bw.elem_offset, n_expert, n_used, n_expert, (uint32_t) (ids->nb[1] / 4),
-        n_used, n_tokens, ggml_d3d12_u32_from_f32(clamp_min), ggml_d3d12_u32_from_f32(clamp_max),
+        n_used, n_tokens, ggml_d3d12_u32_from_f32(clamp_min), ggml_d3d12_u32_from_f32(clamp_max), 0u,
     };
     ggml_d3d12_dispatch(dev, pipeline, params, { bl.va, bi.va, bw.va }, n_tokens);
     return n;
+}
+
+// exp802: sigmoid gating + expert bias + norm (upstream TOPK_MOE_SIGMOID_NORM_BIAS, used by LFM2): 11 nodes, one dispatch
+static int ggml_d3d12_encode_topk_moe_sigmoid(d3d12_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
+    static constexpr std::initializer_list<ggml_op> ops = {
+        GGML_OP_UNARY,   GGML_OP_RESHAPE,  GGML_OP_ADD,  GGML_OP_ARGSORT, GGML_OP_VIEW,    GGML_OP_GET_ROWS,
+        GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV,    GGML_OP_RESHAPE,
+    };
+    if (dev.no_fuse || ggml_get_unary_op(cgraph->nodes[i]) != GGML_UNARY_OP_SIGMOID) {
+        return 0;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, i, ops, { i + 4, i + 10 }) ||
+        !ggml_check_edges(cgraph, i, { { 1, 0, 0 }, { 2, 0, 0 }, { 3, 0, 2 }, { 4, 0, 3 }, { 5, 0, 1 }, { 5, 1, 4 },
+                                       { 6, 0, 5 }, { 7, 0, 6 }, { 8, 0, 7 }, { 9, 0, 6 }, { 9, 1, 8 }, { 10, 0, 9 } })) {
+        return 0;
+    }
+    ggml_tensor * logits  = cgraph->nodes[i]->src[0];
+    ggml_tensor * bias    = cgraph->nodes[i + 2]->src[1];
+    ggml_tensor * ids     = cgraph->nodes[i + 4];
+    ggml_tensor * weights = cgraph->nodes[i + 10];
+    const uint32_t n_expert = (uint32_t) logits->ne[0];
+    const uint32_t n_used   = (uint32_t) ids->ne[0];
+    const uint32_t n_tokens = (uint32_t) logits->ne[1];
+    if (logits->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
+        ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(logits) || !ggml_is_contiguous(bias) || ggml_nrows(bias) != 1 ||
+        bias->ne[0] != (int64_t) n_expert || !ggml_is_contiguous(weights) || ggml_nrows(logits) != n_tokens ||
+        n_expert > 1024 || n_used > n_expert || ids->nb[0] != sizeof(int32_t) || ids->ne[1] != (int64_t) n_tokens ||
+        ggml_nelements(weights) != (int64_t) n_used * n_tokens) {
+        return 0;
+    }
+    const float clamp_min = ggml_get_op_params_f32(cgraph->nodes[i + 8], 0);
+    const float clamp_max = ggml_get_op_params_f32(cgraph->nodes[i + 8], 1);
+    ggml_d3d12_group_barrier(dev, cgraph->nodes + i, 11);
+    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "topk_moe", hlsl_topk_moe, { "NORM", "SIGMOID" });
+    const d3d12_binding bl = ggml_d3d12_bind_tensor(logits);
+    const d3d12_binding bi = ggml_d3d12_bind_tensor(ids);
+    const d3d12_binding bw = ggml_d3d12_bind_tensor(weights);
+    const d3d12_binding bb = ggml_d3d12_bind_tensor(bias);
+    const std::vector<uint32_t> params = {
+        bl.elem_offset, bi.elem_offset, bw.elem_offset, n_expert, n_used, n_expert, (uint32_t) (ids->nb[1] / 4),
+        n_used, n_tokens, ggml_d3d12_u32_from_f32(clamp_min), ggml_d3d12_u32_from_f32(clamp_max), bb.elem_offset,
+    };
+    ggml_d3d12_dispatch(dev, pipeline, params, { bl.va, bi.va, bw.va, bb.va }, n_tokens);
+    return 11;
 }
 
 static bool ggml_d3d12_is_noop(const ggml_tensor * node) {
@@ -4163,6 +4214,12 @@ static int ggml_d3d12_encode_nodes(d3d12_device_ctx & dev, const ggml_cgraph * c
         }
         if (node->op == GGML_OP_SOFT_MAX) {
             const int n = ggml_d3d12_encode_topk_moe(dev, cgraph, i);
+            if (n > 0) {
+                return n;
+            }
+        }
+        if (node->op == GGML_OP_UNARY) {
+            const int n = ggml_d3d12_encode_topk_moe_sigmoid(dev, cgraph, i);
             if (n > 0) {
                 return n;
             }
