@@ -328,6 +328,41 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             }
         }
     }
+#elif defined(SRC0_Q4_K) && defined(NCOLS) && !defined(SRC1_F16)
+    // single column: header and nibbles as Load4s (144-byte blocks are 16-byte aligned), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        [unroll] for (uint cc = 0; cc < NCOLS; cc++) {   // exp875: decode shared across the columns
+        const uint  blk  = sb / 8;
+        const uint  s    = sb % 8;
+        const uint  base = (src0_base + blk) * 144;
+        const uint4 hd   = src0.Load4(base);
+        const float d    = f16tof32(hd.x & 0xFFFFu);
+        const float dmin = f16tof32(hd.x >> 16);
+        uint sc, mn;
+        if (s < 4) {
+            sc = byte_of(hd.y, s) & 63u;
+            mn = byte_of(hd.z, s) & 63u;
+        } else {
+            sc = (byte_of(hd.w, s - 4) & 0xFu) | ((byte_of(hd.y, s - 4) >> 6) << 4);
+            mn = (byte_of(hd.w, s - 4) >> 4) | ((byte_of(hd.z, s - 4) >> 6) << 4);
+        }
+        const uint  shift = (s & 1u) * 4u;
+        const uint  qbase = base + 16 + 32 * (s / 2);
+        const uint4 q0    = src0.Load4(qbase);
+        const uint4 q1    = src0.Load4(qbase + 16);
+        const uint  Q[8]  = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+        const uint  ys    = (src1_base[cc] + blk * 256 + s * 32) * 4;
+        float sq = 0.0f, sy = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const float4 y = asfloat(src1.Load4(ys + 16 * j));
+            const uint   q = Q[j] >> shift;
+            sq += (float) (q & 0xFu) * y.x + (float) ((q >> 8) & 0xFu) * y.y +
+                  (float) ((q >> 16) & 0xFu) * y.z + (float) ((q >> 24) & 0xFu) * y.w;
+            sy += y.x + y.y + y.z + y.w;
+        }
+        acc[cc] += d * (float) sc * sq - dmin * (float) mn * sy;
+        }
+    }
 #elif defined(SRC0_Q4_K) && defined(ONE_COL) && !defined(SRC1_F16)
     // single column: header and nibbles as Load4s (144-byte blocks are 16-byte aligned), src1 as Load4s
     for (uint sb = lane; sb < k / 32; sb += TPR) {
@@ -360,6 +395,50 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             sy += y.x + y.y + y.z + y.w;
         }
         acc[0] += d * (float) sc * sq - dmin * (float) mn * sy;
+    }
+#elif defined(SRC0_Q6_K) && defined(NCOLS) && !defined(SRC1_F16)
+    // single column: ql and qh as 36-byte windows (2x Load4 + Load; 210-byte blocks start on 2 bytes), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        [unroll] for (uint cc = 0; cc < NCOLS; cc++) {   // exp875: decode shared across the columns
+        const uint blk  = sb / 8;
+        const uint s    = sb % 8;
+        const uint h    = s / 4;
+        const uint t    = s % 4;
+        const uint base = (src0_base + blk) * 210;
+        uint dbits;
+        LOAD_U16_UNALIGNED(src0, base + 208, dbits);
+        const float d = f16tof32(dbits);
+        const uint  ql_base = base + 64 * h + 32 * (t & 1u);
+        const uint  qh_base = base + 128 + 32 * h;
+        const uint  sc_base = base + 192 + 8 * h + 2 * t;
+        const uint  lshift  = (t >> 1) * 4u;
+        const uint  hshift  = t * 2u;
+        uint scw;
+        LOAD_U32_UNALIGNED(src0, sc_base, scw);
+        const bool  odd  = (base & 2u) != 0;   // ql_base and qh_base share base's 4-byte phase
+        const uint  la   = ql_base & ~3u;
+        const uint  ha   = qh_base & ~3u;
+        const uint4 l0   = src0.Load4(la);
+        const uint4 l1   = src0.Load4(la + 16);
+        const uint4 h0   = src0.Load4(ha);
+        const uint4 h1   = src0.Load4(ha + 16);
+        const uint  L[9] = { l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w, src0.Load(la + 32) };
+        const uint  H[9] = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w, src0.Load(ha + 32) };
+        const uint  ys   = (src1_base[cc] + blk * 256 + s * 32) * 4;
+        float sum0 = 0.0f, sum1 = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const uint   ql = odd ? ((L[j] >> 16) | (L[j + 1] << 16)) : L[j];
+            const uint   qh = odd ? ((H[j] >> 16) | (H[j + 1] << 16)) : H[j];
+            const float4 y  = asfloat(src1.Load4(ys + 16 * j));
+            float p = 0.0f;
+            [unroll] for (uint b = 0; b < 4; b++) {
+                const int q = (int) (((byte_of(ql, b) >> lshift) & 0xFu) | (((byte_of(qh, b) >> hshift) & 3u) << 4)) - 32;
+                p += (float) q * y[b];
+            }
+            if (j < 4) { sum0 += p; } else { sum1 += p; }
+        }
+        acc[cc] += d * ((float) sbyte_of(scw, 0) * sum0 + (float) sbyte_of(scw, 1) * sum1);
+        }
     }
 #elif defined(SRC0_Q6_K) && defined(ONE_COL) && !defined(SRC1_F16)
     // single column: ql and qh as 36-byte windows (2x Load4 + Load; 210-byte blocks start on 2 bytes), src1 as Load4s
@@ -402,6 +481,46 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             if (j < 4) { sum0 += p; } else { sum1 += p; }
         }
         acc[0] += d * ((float) sbyte_of(scw, 0) * sum0 + (float) sbyte_of(scw, 1) * sum1);
+    }
+#elif defined(SRC0_Q5_K) && defined(NCOLS) && !defined(SRC1_F16)
+    // single column: header, qh and ql as Load4s (176-byte blocks are 16-byte aligned), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        [unroll] for (uint cc = 0; cc < NCOLS; cc++) {   // exp875: decode shared across the columns
+        const uint  blk  = sb / 8;
+        const uint  s    = sb % 8;
+        const uint  base = (src0_base + blk) * 176;
+        const uint4 hd   = src0.Load4(base);
+        const float d    = f16tof32(hd.x & 0xFFFFu);
+        const float dmin = f16tof32(hd.x >> 16);
+        uint sc, mn;
+        if (s < 4) {
+            sc = byte_of(hd.y, s) & 63u;
+            mn = byte_of(hd.z, s) & 63u;
+        } else {
+            sc = (byte_of(hd.w, s - 4) & 0xFu) | ((byte_of(hd.y, s - 4) >> 6) << 4);
+            mn = (byte_of(hd.w, s - 4) >> 4) | ((byte_of(hd.z, s - 4) >> 6) << 4);
+        }
+        const uint  shift = (s & 1u) * 4u;
+        const uint  qbase = base + 48 + 32 * (s / 2);
+        const uint4 q0    = src0.Load4(qbase);
+        const uint4 q1    = src0.Load4(qbase + 16);
+        const uint4 h0    = src0.Load4(base + 16);
+        const uint4 h1    = src0.Load4(base + 32);
+        const uint  Q[8]  = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+        const uint  H[8]  = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w };
+        const uint  ys    = (src1_base[cc] + blk * 256 + s * 32) * 4;
+        float sq = 0.0f, sy = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const float4 y = asfloat(src1.Load4(ys + 16 * j));
+            const uint   q = (Q[j] >> shift) & 0x0F0F0F0Fu;
+            const uint   h = ((H[j] >> s) & 0x01010101u) << 4;   // bit s of each qh byte -> +16
+            const uint   v = q | h;
+            sq += (float) (v & 0xFFu) * y.x + (float) ((v >> 8) & 0xFFu) * y.y +
+                  (float) ((v >> 16) & 0xFFu) * y.z + (float) (v >> 24) * y.w;
+            sy += y.x + y.y + y.z + y.w;
+        }
+        acc[cc] += d * (float) sc * sq - dmin * (float) mn * sy;
+        }
     }
 #elif defined(SRC0_Q5_K) && defined(ONE_COL) && !defined(SRC1_F16)
     // single column: header, qh and ql as Load4s (176-byte blocks are 16-byte aligned), src1 as Load4s
@@ -514,6 +633,39 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             }
         }
     }
+#elif defined(SRC0_Q2_K) && defined(NCOLS) && !defined(SRC1_F16)
+    // single column: scales, d/dmin and the 2-bit quants as Loads (84-byte blocks are 4-byte aligned), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        [unroll] for (uint cc = 0; cc < NCOLS; cc++) {   // exp875: decode shared across the columns
+        const uint  blk  = sb / 8;
+        const uint  s    = sb % 8;
+        const uint  base = (src0_base + blk) * 84;
+        const uint  w    = src0.Load(base + 80);
+        const float d    = f16tof32(w & 0xFFFFu);
+        const float dmin = f16tof32(w >> 16);
+        const uint  scw  = (src0.Load(base + 4 * (s / 2)) >> (16u * (s % 2u))) & 0xFFFFu;
+        const float dl0  = d * (float) (scw & 0xFu);
+        const float ml0  = dmin * (float) ((scw >> 4) & 0xFu);
+        const float dl1  = d * (float) ((scw >> 8) & 0xFu);
+        const float ml1  = dmin * (float) (scw >> 12);
+        const uint  shift = 2u * (s % 4u);
+        const uint  qbase = base + 16 + 32 * (s / 4);
+        const uint4 q0   = src0.Load4(qbase);
+        const uint4 q1   = src0.Load4(qbase + 16);
+        const uint  Q[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+        const uint  ys   = (src1_base[cc] + blk * 256 + s * 32) * 4;
+        float sqa = 0.0f, sya = 0.0f, sqb = 0.0f, syb = 0.0f;
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const float4 y = asfloat(src1.Load4(ys + 16 * j));
+            const uint   v = (Q[j] >> shift) & 0x03030303u;
+            const float  sq = (float) (v & 0xFFu) * y.x + (float) ((v >> 8) & 0xFFu) * y.y +
+                              (float) ((v >> 16) & 0xFFu) * y.z + (float) (v >> 24) * y.w;
+            const float  sy = y.x + y.y + y.z + y.w;
+            if (j < 4) { sqa += sq; sya += sy; } else { sqb += sq; syb += sy; }
+        }
+        acc[cc] += dl0 * sqa - ml0 * sya + dl1 * sqb - ml1 * syb;
+        }
+    }
 #elif defined(SRC0_Q2_K) && defined(ONE_COL) && !defined(SRC1_F16)
     // single column: scales, d/dmin and the 2-bit quants as Loads (84-byte blocks are 4-byte aligned), src1 as Load4s
     for (uint sb = lane; sb < k / 32; sb += TPR) {
@@ -613,6 +765,33 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             }
         }
     }
+#elif defined(SRC0_IQ4_XS) && defined(NCOLS) && !defined(SRC1_F16)
+    // single column: header and the 16 nibble bytes of the sub-block as Loads (136-byte blocks are 4-byte aligned), src1 as Load4s
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        [unroll] for (uint cc = 0; cc < NCOLS; cc++) {   // exp875: decode shared across the columns
+        const uint  blk  = sb / 8;
+        const uint  s    = sb % 8;
+        const uint  base = (src0_base + blk) * 136;
+        const uint2 hd   = src0.Load2(base);
+        const float d    = f16tof32(hd.x & 0xFFFFu);
+        const uint  ls   = ((byte_of(hd.y, s / 2) >> (4 * (s % 2))) & 0xFu) | ((((hd.x >> 16) >> (2 * s)) & 3u) << 4);
+        const float dl   = d * ((float) ls - 32.0f);
+        const uint4 q    = src0.Load4(base + 8 + 16 * s);
+        const uint  Q[4] = { q.x, q.y, q.z, q.w };
+        const uint  ys   = (src1_base[cc] + blk * 256 + s * 32) * 4;
+        float sum = 0.0f;
+        [unroll] for (uint j = 0; j < 4; j++) {
+            const float4 ylo = asfloat(src1.Load4(ys + 16 * j));
+            const float4 yhi = asfloat(src1.Load4(ys + 64 + 16 * j));
+            const uint   w   = Q[j];
+            sum += KVALUES_IQ4NL[w & 0xFu] * ylo.x + KVALUES_IQ4NL[(w >> 8) & 0xFu] * ylo.y +
+                   KVALUES_IQ4NL[(w >> 16) & 0xFu] * ylo.z + KVALUES_IQ4NL[(w >> 24) & 0xFu] * ylo.w +
+                   KVALUES_IQ4NL[(w >> 4) & 0xFu] * yhi.x + KVALUES_IQ4NL[(w >> 12) & 0xFu] * yhi.y +
+                   KVALUES_IQ4NL[(w >> 20) & 0xFu] * yhi.z + KVALUES_IQ4NL[w >> 28] * yhi.w;
+        }
+        acc[cc] += dl * sum;
+        }
+    }
 #elif defined(SRC0_IQ4_XS) && defined(ONE_COL) && !defined(SRC1_F16)
     // single column: header and the 16 nibble bytes of the sub-block as Loads (136-byte blocks are 4-byte aligned), src1 as Load4s
     for (uint sb = lane; sb < k / 32; sb += TPR) {
@@ -661,6 +840,57 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             }
         }
     }
+#elif (defined(SRC0_IQ3_XXS) || defined(SRC0_IQ3_S)) && defined(NCOLS) && !defined(SRC1_F16)
+    // exp872: the exp843 single-column kernel for NCOLS (2..4) columns: the 8 weights of each grid pair are decoded once
+    // and multiplied into every column.
+#define IQ_SV(g, b, sg, j) (((((sg) >> (j)) & 1u) != 0u) ? -(float) byte_of(g, b) : (float) byte_of(g, b))
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        const uint blk = sb / 8;
+        const uint s   = sb % 8;
+#if defined(SRC0_IQ3_XXS)
+        const uint base = (src0_base + blk) * 98;
+        uint dbits, aux, q0, q1;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 66 + 4 * s, aux);
+        const float db = f16tof32(dbits) * (0.5f + (float) (aux >> 28)) * 0.5f;
+#else
+        const uint base = (src0_base + blk) * 110;
+        uint dbits, sc, qh, sgw, q0, q1;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 106 + s / 2, sc);
+        LOAD_U32_UNALIGNED(src0, base + 66 + s, qh);
+        LOAD_U32_UNALIGNED(src0, base + 74 + 4 * s, sgw);
+        const float db = f16tof32(dbits) * (float) (1u + 2u * ((sc >> (4u * (s & 1u))) & 0xFu));
+#endif
+        LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s, q0);
+        LOAD_U32_UNALIGNED(src0, base + 6 + 8 * s, q1);
+        float sum[NCOLS];
+        [unroll] for (uint c0 = 0; c0 < NCOLS; c0++) {
+            sum[c0] = 0.0f;
+        }
+        IQ_LUNROLL for (uint l = IQ_L0; l < IQ_L1; l++) {
+            const uint q = (l < 2 ? q0 : q1) >> (16u * (l & 1u));
+#if defined(SRC0_IQ3_XXS)
+            const uint sg = KSIGNS[(aux >> (7u * l)) & 127u];
+            const uint g1 = IQ3XXS_GRID[q & 0xFFu];
+            const uint g2 = IQ3XXS_GRID[(q >> 8) & 0xFFu];
+#else
+            const uint sg = byte_of(sgw, l);
+            const uint g1 = IQ3S_GRID[(q & 0xFFu) | (((qh >> (2u * l)) & 1u) << 8)];
+            const uint g2 = IQ3S_GRID[((q >> 8) & 0xFFu) | (((qh >> (2u * l + 1u)) & 1u) << 8)];
+#endif
+            const float4 wa = float4(IQ_SV(g1, 0, sg, 0), IQ_SV(g1, 1, sg, 1), IQ_SV(g1, 2, sg, 2), IQ_SV(g1, 3, sg, 3));
+            const float4 wb = float4(IQ_SV(g2, 0, sg, 4), IQ_SV(g2, 1, sg, 5), IQ_SV(g2, 2, sg, 6), IQ_SV(g2, 3, sg, 7));
+            [unroll] for (uint c = 0; c < NCOLS; c++) {
+                const uint ys = (src1_base[c] + blk * 256 + s * 32) * 4;
+                sum[c] += dot(wa, asfloat(src1.Load4(ys + 32 * l))) + dot(wb, asfloat(src1.Load4(ys + 32 * l + 16)));
+            }
+        }
+        [unroll] for (uint c1 = 0; c1 < NCOLS; c1++) {
+            acc[c1] += db * sum[c1];
+        }
+    }
+#undef IQ_SV
 #elif (defined(SRC0_IQ3_XXS) || defined(SRC0_IQ3_S)) && defined(ONE_COL) && !defined(SRC1_F16)
     // exp843: single column: the 8 grid-index bytes of the sub-block as 2 words, src1 as Load4s, the scale applied once per sub-block.
     // Layouts as in the generic IQ3_XXS / IQ3_S branches below.
@@ -733,6 +963,72 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
             }
         }
     }
+#elif (defined(SRC0_IQ2_S) || defined(SRC0_IQ2_XXS) || defined(SRC0_IQ2_XS)) && defined(NCOLS) && !defined(SRC1_F16)
+    // exp844: single column, src1 as Load4s, the scale applied once per group of 8 (layouts as in the generic branches below)
+#define IQ_SV(g, b, sg, j) (((((sg) >> (j)) & 1u) != 0u) ? -(float) byte_of(g, b) : (float) byte_of(g, b))
+    for (uint sb = lane; sb < k / 32; sb += TPR) {
+        [unroll] for (uint cc = 0; cc < NCOLS; cc++) {   // exp875: decode shared across the columns
+        const uint blk = sb / 8;
+        const uint s   = sb % 8;
+        const uint ys  = (src1_base[cc] + blk * 256 + s * 32) * 4;
+#if defined(SRC0_IQ2_S)
+        const uint base = (src0_base + blk) * 82;
+        uint dbits, sc, qh, qw, sgw;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 74 + s, sc);
+        LOAD_U32_UNALIGNED(src0, base + 66 + s, qh);
+        LOAD_U32_UNALIGNED(src0, base + 2 + 4 * s, qw);
+        LOAD_U32_UNALIGNED(src0, base + 34 + 4 * s, sgw);
+        const float d = f16tof32(dbits);
+#elif defined(SRC0_IQ2_XXS)
+        const uint base = (src0_base + blk) * 66;
+        uint dbits, a0, a1;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s, a0);
+        LOAD_U32_UNALIGNED(src0, base + 6 + 8 * s, a1);
+        const float db = f16tof32(dbits) * (0.5f + (float) (a1 >> 28)) * 0.25f;
+#else
+        const uint base = (src0_base + blk) * 74;
+        uint dbits, sc, q01, q23;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 66 + s, sc);
+        LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s, q01);
+        LOAD_U32_UNALIGNED(src0, base + 6 + 8 * s, q23);
+        const float d   = f16tof32(dbits);
+        const float db0 = d * (0.5f + (float) (sc & 0xFu)) * 0.25f;
+        const float db1 = d * (0.5f + (float) ((sc >> 4) & 0xFu)) * 0.25f;
+#endif
+        float sum = 0.0f;
+        IQ_LUNROLL for (uint l = IQ_L0; l < IQ_L1; l++) {
+#if defined(SRC0_IQ2_S)
+            const uint  gi = byte_of(qw, l) | (((qh >> (2u * l)) & 3u) << 8);
+            const uint  sg = byte_of(sgw, l);
+            const float dl = d * (0.5f + (float) ((sc >> (l < 2 ? 0u : 4u)) & 0xFu)) * 0.25f;
+            const uint  g1 = IQ2S_GRID_LO[gi];
+            const uint  g2 = IQ2S_GRID_HI[gi];
+#elif defined(SRC0_IQ2_XXS)
+            const uint  gi = byte_of(a0, l);
+            const uint  sg = KSIGNS[(a1 >> (7u * l)) & 127u];
+            const float dl = db;
+            const uint  g1 = IQ2XXS_GRID_LO[gi];
+            const uint  g2 = IQ2XXS_GRID_HI[gi];
+#else
+            const uint  q  = ((l < 2 ? q01 : q23) >> (16u * (l & 1u))) & 0xFFFFu;
+            const uint  gi = q & 511u;
+            const uint  sg = KSIGNS[(q >> 9) & 127u];
+            const float dl = l < 2 ? db0 : db1;
+            const uint  g1 = IQ2XS_GRID_LO[gi];
+            const uint  g2 = IQ2XS_GRID_HI[gi];
+#endif
+            const float4 ya = asfloat(src1.Load4(ys + 32 * l));
+            const float4 yb = asfloat(src1.Load4(ys + 32 * l + 16));
+            sum += dl * (IQ_SV(g1, 0, sg, 0) * ya.x + IQ_SV(g1, 1, sg, 1) * ya.y + IQ_SV(g1, 2, sg, 2) * ya.z + IQ_SV(g1, 3, sg, 3) * ya.w +
+                         IQ_SV(g2, 0, sg, 4) * yb.x + IQ_SV(g2, 1, sg, 5) * yb.y + IQ_SV(g2, 2, sg, 6) * yb.z + IQ_SV(g2, 3, sg, 7) * yb.w);
+        }
+        acc[cc] += sum;
+        }
+    }
+#undef IQ_SV
 #elif (defined(SRC0_IQ2_S) || defined(SRC0_IQ2_XXS) || defined(SRC0_IQ2_XS)) && defined(ONE_COL) && !defined(SRC1_F16)
     // exp844: single column, src1 as Load4s, the scale applied once per group of 8 (layouts as in the generic branches below)
 #define IQ_SV(g, b, sg, j) (((((sg) >> (j)) & 1u) != 0u) ? -(float) byte_of(g, b) : (float) byte_of(g, b))

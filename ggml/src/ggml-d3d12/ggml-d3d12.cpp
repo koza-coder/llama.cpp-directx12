@@ -1807,7 +1807,16 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     const bool     mc_type  = (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && dev.mv_multi;
     const bool     per_col  = mats[0].dst->ne[1] > 1 && (uint32_t) mats[0].dst->ne[1] <= percol_max && !mc_type;
     const bool     one_col  = (mats[0].dst->ne[1] == 1 || per_col) && src0->type != GGML_TYPE_F32;
-    const uint32_t max_cols = one_col ? 1 : 4;
+    // exp872: 2..4 columns of IQ3 types in one dispatch, each weight decoded once for every column (MTP verify batches);
+    // GGML_D3D12_MV_NC=0 turns it off
+    static const int nc_env = [] { const char * e = getenv("GGML_D3D12_MV_NC"); return e ? atoi(e) : 1; }();
+    const uint32_t ncols_fixed = nc_env != 0 && per_col && mats[0].dst->ne[1] <= 4 && src1->type == GGML_TYPE_F32 &&
+                                 (src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ3_S ||
+                                  // exp875: the generated column-loop copies of the other single-column kernels
+                                  src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
+                                  src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ2_S ||
+                                  src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS) ? (uint32_t) mats[0].dst->ne[1] : 0u;
+    const uint32_t max_cols = ncols_fixed ? ncols_fixed : one_col ? 1 : 4;
     // exp361: 2..4 columns with the word-window kernels (each weight word decoded once, FMA into up to 4 columns)
     const bool multi_col = dev.mv_multi && !one_col && mats[0].dst->ne[1] > 1 &&
                            (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) &&
@@ -1818,6 +1827,9 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     }
     if (multi_col) {
         defines.push_back("MULTI_COL");
+    }
+    if (ncols_fixed) {
+        defines.push_back("NCOLS=" + std::to_string(ncols_fixed));
     }
     // On the AMD Vega iGPU every N_MATS=2 kernel without FUSE_ADD hung the GPU (DEVICE_HUNG, 2026-09-19); taking
     // the FUSE_ADD variant for groups (add_flag 0 skips the add at run time) avoids it. Why the variant matters is
@@ -1834,7 +1846,7 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     }
     // exp861: GGML_D3D12_MV_RPT=2 -> each thread also computes the row WG_SIZE/tpr further on (Strata-style 2 rows per thread)
     static const int rpt_env = [] { const char * e = getenv("GGML_D3D12_MV_RPT"); return e ? atoi(e) : 1; }();
-    const bool rpt2 = rpt_env == 2 && one_col && !multi_col && !fuse_add &&
+    const bool rpt2 = rpt_env == 2 && one_col && !multi_col && !fuse_add && !ncols_fixed &&
                       !std::count(defines.begin(), defines.end(), std::string("FUSE_ADD")) &&
                       (uint32_t) mats[0].dst->ne[0] >= 2 * (D3D12_WG_SIZE / tpr);
     if (rpt2) {
