@@ -1859,6 +1859,11 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     if (ggml_d3d12_iq_gs(dev, src0->type)) {
         defines.push_back("IQ_GS");
     }
+    // exp972/exp973: Q6_K matvec that loads every quant byte once (dequant_row.hlsli), single column and NCOLS; GGML_D3D12_Q6K_V2=0 = old code
+    static const bool q6k_v2 = [] { const char * e = getenv("GGML_D3D12_Q6K_V2"); return !e || atoi(e) != 0; }();
+    if (q6k_v2 && src0->type == GGML_TYPE_Q6_K && one_col && !multi_col && src1->type == GGML_TYPE_F32) {
+        defines.push_back("Q6K_V2");
+    }
     // exp861: GGML_D3D12_MV_RPT=2 -> each thread also computes the row WG_SIZE/tpr further on (Strata-style 2 rows per thread)
     static const int rpt_env = [] { const char * e = getenv("GGML_D3D12_MV_RPT"); return e ? atoi(e) : 1; }();
     const bool rpt2 = rpt_env == 2 && one_col && !multi_col && !fuse_add && !ncols_fixed &&
@@ -2203,6 +2208,45 @@ static void ggml_d3d12_rms_norm(d3d12_device_ctx & dev, ggml_tensor * src, ggml_
 
 // ARGSORT and TOP_K share one kernel; TOP_K keeps the k largest (dst->ne[0]) in no particular order
 static void ggml_d3d12_argsort(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    // exp970: small k over long rows (draft samplers: top_k 10 over a 248k vocab) in two passes, see topk_small.hlsl
+    static const bool topk_small = [] { const char * e = getenv("GGML_D3D12_TOPK_SMALL"); return e ? atoi(e) != 0 : true; }();
+    if (topk_small && dst->op == GGML_OP_TOP_K && src->ne[0] > 1024 && dst->ne[0] <= 32 && src->type == GGML_TYPE_F32) {
+        const uint32_t ne0      = (uint32_t) src->ne[0];
+        const uint32_t k        = (uint32_t) dst->ne[0];
+        const uint32_t n_chunks = CEIL_DIV(ne0, (uint32_t) D3D12_WG_SIZE * 16);
+        const uint32_t rows     = (uint32_t) ggml_nrows(src);
+        if (n_chunks * k <= (uint32_t) D3D12_WG_SIZE * 32) {
+            const size_t need = (size_t) rows * n_chunks * k * 8;
+            if (!dev.collecting && need > dev.topk_scratch_size) {
+                // commands already recorded may still use the old buffer: run them before it is replaced
+                if (dev.dispatches_in_list > 0) {
+                    ggml_d3d12_submit_and_wait(dev);
+                    ggml_d3d12_begin(dev, true);
+                }
+                if (dev.uav_table && dev.topk_scratch) {
+                    dev.va_map.erase(dev.topk_scratch->GetGPUVirtualAddress());
+                }
+                const size_t size = std::max(need, dev.topk_scratch_size * 2);
+                dev.topk_scratch  = ggml_d3d12_create_buffer(dev, size, D3D12_HEAP_TYPE_DEFAULT, L"ggml_d3d12 topk scratch");
+                GGML_ASSERT(dev.topk_scratch);
+                dev.topk_scratch_size = size;
+            }
+            const D3D12_GPU_VIRTUAL_ADDRESS sc = dev.topk_scratch ? dev.topk_scratch->GetGPUVirtualAddress() : 0;
+            // the scratch is not a tensor: the range tracking cannot see that an earlier TOP_K still reads it
+            dev.barrier_pending = !dev.no_barrier;
+            const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
+            const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+            d3d12_pipeline & p1 = ggml_d3d12_get_pipeline(dev, "topk_small", hlsl_topk_small, {});
+            d3d12_pipeline & p2 = ggml_d3d12_get_pipeline(dev, "topk_small", hlsl_topk_small, { "PASS2" });
+            const std::vector<uint32_t> prm1 = { bs.elem_offset, 0u, ne0, k, n_chunks, rows, (uint32_t) src->ne[1], (uint32_t) src->ne[2],
+                                                 (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4) };
+            ggml_d3d12_dispatch(dev, p1, prm1, { bs.va, sc }, rows * n_chunks);
+            const std::vector<uint32_t> prm2 = { 0u, bd.elem_offset, n_chunks * k, k, n_chunks, rows, (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+                                                 (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4) };
+            ggml_d3d12_dispatch(dev, p2, prm2, { sc, bd.va }, rows);
+            return;
+        }
+    }
     std::vector<std::string> defines;
     if (dst->op == GGML_OP_TOP_K || (ggml_sort_order) ggml_get_op_params_i32(dst, 0) == GGML_SORT_ORDER_DESC) {
         defines.push_back("SORT_DESC");

@@ -5,6 +5,7 @@
 // Positions at or beyond ne0 stand for +infinity (they never move), so any ne0 works; every comparison puts the
 // smaller element at the lower position, the first step of a stage compares position p with its mirror in the 2h block.
 // Ties keep the smaller source index first. defines: SORT_DESC
+// exp970: TOP_K with k <= 32 goes to topk_small.hlsl (two dispatches) instead.
 // mode 0: dst[i] = i (one thread per element); mode 1: one compare-exchange step (one thread per pair)
 
 RWByteAddressBuffer src : register(u0);
