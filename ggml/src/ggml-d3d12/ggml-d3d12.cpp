@@ -1644,9 +1644,12 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     static const char * bts_env = getenv("GGML_D3D12_BT_SHAPE");
     const bool          bt_wide = bts_env ? atoi(bts_env) != 0 : dev.vendor_id != 0x1ED5;
     const uint32_t      bt_tm   = bt_wide ? 128u : 64u;
-    const uint32_t      bt_tn   = bt_wide ? 64u : 32u;
+    // exp900: GGML_D3D12_BT_TN 32 / 64 / 128 widens the Moore Threads tile (BT_RN = TN / 16), test switch
+    static const int    btn_env = [] { const char * e = getenv("GGML_D3D12_BT_TN"); return e ? atoi(e) : 0; }();
+    const uint32_t      mt_tn   = (btn_env == 64 || btn_env == 128) ? (uint32_t) btn_env : 32u;
+    const uint32_t      bt_tn   = bt_wide ? 64u : mt_tn;
     const uint32_t      bt_rm   = bt_wide ? 8u : 4u;
-    const uint32_t      bt_rn   = bt_wide ? 4u : 2u;
+    const uint32_t      bt_rn   = bt_wide ? 4u : mt_tn / 16u;
     // exp622: with the DP4a kernel the K-quants Q4_K / Q6_K take the big tile too (it has loaders for them; the fp32 big tile has not)
     bool dp4a_ok = false;
 #ifdef GGML_D3D12_BT_DP4A
@@ -1655,9 +1658,21 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     // exp832: without DP4a (Moore Threads) Q4_K / Q6_K take the fp32 big tile (GGML_D3D12_BT_KQ 0 / 1 forces it)
     static const char * kq_env = getenv("GGML_D3D12_BT_KQ");
     const bool kq_fp32 = !dp4a_ok && (kq_env ? atoi(kq_env) != 0 : dev.vendor_id == 0x1ED5);
-    const bool big = bt_on && dst->ne[1] >= bt_tn &&
+    // exp882: IQ3_XXS / IQ3_S / IQ4_XS loaders in the fp32 big tile, Moore Threads tile shape only (GGML_D3D12_BT_IQ 0 / 1 forces it)
+    static const char * btiq_env = getenv("GGML_D3D12_BT_IQ");
+    const bool iq_fp32 = !dp4a_ok && !bt_wide && (btiq_env ? atoi(btiq_env) != 0 : dev.vendor_id == 0x1ED5);
+    // exp897: IQ2_XXS / IQ2_XS / IQ2_S / Q2_K loaders, same tile shape (GGML_D3D12_BT_IQ2 0 / 1 forces them)
+    static const char * btiq2_env = getenv("GGML_D3D12_BT_IQ2");
+    const bool iq2_fp32 = !dp4a_ok && !bt_wide && (btiq2_env ? atoi(btiq2_env) != 0 : dev.vendor_id == 0x1ED5);
+    // exp895: on Moore Threads the big tile from 16 columns (16..31-token chat prompts: one partly filled tile instead of the old tiled kernel)
+    static const char * btmin_env = getenv("GGML_D3D12_BT_MIN");
+    const uint32_t bt_min = btmin_env ? (uint32_t) std::max(1, atoi(btmin_env)) : dev.vendor_id == 0x1ED5 ? 16u : bt_tn;
+    const bool big = bt_on && (uint32_t) dst->ne[1] >= bt_min &&
                      (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 ||
-                      ((dp4a_ok && bt_wide) || kq_fp32) && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K));
+                      ((dp4a_ok && bt_wide) || kq_fp32) && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) ||
+                      iq_fp32 && (src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ4_XS) ||
+                      iq2_fp32 && (src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ2_S ||
+                                   src0->type == GGML_TYPE_Q2_K));
     bool use_dp4a = false;
     if (big) {
         defines.push_back("BIG_TILE");
@@ -1810,7 +1825,7 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     // exp872: 2..4 columns of IQ3 types in one dispatch, each weight decoded once for every column (MTP verify batches);
     // GGML_D3D12_MV_NC=0 turns it off
     static const int nc_env = [] { const char * e = getenv("GGML_D3D12_MV_NC"); return e ? atoi(e) : 1; }();
-    const uint32_t ncols_fixed = nc_env != 0 && per_col && mats[0].dst->ne[1] <= 4 && src1->type == GGML_TYPE_F32 &&
+    const uint32_t ncols_fixed = nc_env != 0 && per_col && mats[0].dst->ne[1] <= 8 && src1->type == GGML_TYPE_F32 &&   // exp885: up to 8
                                  (src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ3_S ||
                                   // exp875: the generated column-loop copies of the other single-column kernels
                                   src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
@@ -5694,8 +5709,9 @@ static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t gg
             for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
                 dev.tiled_type_cols[t] = 5;
             }
+            dev.tiled_type_cols[GGML_TYPE_Q6_K] = 9;   // exp899: matvec 2..8 columns wins up to 8 (exp890)
         } else if (dev.vendor_id == 0x1002) {
-            dev.tiled_type_cols[GGML_TYPE_Q6_K] = 5;
+            dev.tiled_type_cols[GGML_TYPE_Q6_K] = 9;   // exp912: matvec 2..8 columns wins up to 8 (exp911)
         }
     }
     if (const char * env = getenv("GGML_D3D12_DISABLE_OPS")) {
@@ -5757,8 +5773,8 @@ static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t gg
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {};
     rs_desc.NumParameters             = 1 + D3D12_MAX_ROOT_UAVS;
     rs_desc.pParameters               = root_params;
-    // exp163/exp167 (see uav_table): Intel only; GGML_D3D12_UAV_TABLE=0/1 overrides
-    dev.uav_table = dev.vendor_id == 0x8086;
+    // exp163/exp167 (see uav_table): Intel, exp919: Moore Threads too; GGML_D3D12_UAV_TABLE=0/1 overrides
+    dev.uav_table = dev.vendor_id == 0x8086 || dev.vendor_id == 0x1ED5;
     if (const char * env = getenv("GGML_D3D12_UAV_TABLE")) {
         dev.uav_table = atoi(env) != 0;
     }

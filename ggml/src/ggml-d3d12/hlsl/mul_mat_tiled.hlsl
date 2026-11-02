@@ -386,6 +386,12 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     }
 }
 #else   // BT_DP4A
+#if defined(SRC0_IQ3_XXS) || defined(SRC0_IQ3_S) || defined(SRC0_IQ4_XS) || defined(SRC0_IQ2_XXS) || defined(SRC0_IQ2_XS) || defined(SRC0_IQ2_S)
+// exp882 / exp897: IQ loaders below; one staging thread = 8 values (A_ELEMS 8, the Moore Threads 64 x 32 tile)
+#include "iq_tables.hlsli"
+static const float BT_KV_IQ4NL[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+#define BT_IQ_SV(g, b, sg, j) (((((sg) >> (j)) & 1u) != 0u) ? -(float) byte_of(g, b) : (float) byte_of(g, b))
+#endif
 #ifndef BT_AMODE
 #define BT_AMODE 0
 #endif
@@ -620,6 +626,135 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                 [unroll] for (uint b = 0; b < 4; b++) {
                     const int q = (int) (((byte_of(ql, b) >> lshift) & 0xFu) | (((byte_of(qh, b) >> hshift) & 3u) << 4)) - 32;
                     vals[j * 4 + b] = dsc * (float) q;
+                }
+            }
+#elif defined(SRC0_IQ3_XXS) || defined(SRC0_IQ3_S)
+            // exp882: grid pair l = a_part of sub-block s (elements 8 l .. 8 l + 7), layouts as in dequant_row.hlsli
+#if A_ELEMS != 8
+#error "exp882 IQ3 big-tile loader needs A_ELEMS 8"
+#endif
+            const uint blk = kt / 256;
+            const uint s   = (kt % 256) / 32;
+            const uint l   = a_part;
+#if defined(SRC0_IQ3_XXS)
+            const uint base = (a_batch + a_r * stride_01 + blk) * 98;
+            uint dbits, aux, q;
+            LOAD_U16_UNALIGNED(src0, base, dbits);
+            LOAD_U32_UNALIGNED(src0, base + 66 + 4 * s, aux);
+            LOAD_U16_UNALIGNED(src0, base + 2 + 8 * s + 2 * l, q);
+            const float db = f16tof32(dbits) * (0.5f + (float) (aux >> 28)) * 0.5f;
+            const uint  sg = KSIGNS[(aux >> (7u * l)) & 127u];
+            const uint  g1 = IQ3XXS_GRID[q & 0xFFu];
+            const uint  g2 = IQ3XXS_GRID[(q >> 8) & 0xFFu];
+#else
+            const uint base = (a_batch + a_r * stride_01 + blk) * 110;
+            uint dbits, sc, qh, sgw, q;
+            LOAD_U16_UNALIGNED(src0, base, dbits);
+            LOAD_U32_UNALIGNED(src0, base + 106 + s / 2, sc);
+            LOAD_U32_UNALIGNED(src0, base + 66 + s, qh);
+            LOAD_U32_UNALIGNED(src0, base + 74 + 4 * s, sgw);
+            LOAD_U16_UNALIGNED(src0, base + 2 + 8 * s + 2 * l, q);
+            const float db = f16tof32(dbits) * (float) (1u + 2u * ((sc >> (4u * (s & 1u))) & 0xFu));
+            const uint  sg = byte_of(sgw, l);
+            const uint  g1 = IQ3S_GRID[(q & 0xFFu) | (((qh >> (2u * l)) & 1u) << 8)];
+            const uint  g2 = IQ3S_GRID[((q >> 8) & 0xFFu) | (((qh >> (2u * l + 1u)) & 1u) << 8)];
+#endif
+            [unroll] for (uint b = 0; b < 4; b++) {
+                vals[b]     = db * BT_IQ_SV(g1, b, sg, b);
+                vals[4 + b] = db * BT_IQ_SV(g2, b, sg, 4 + b);
+            }
+#elif defined(SRC0_IQ2_XXS) || defined(SRC0_IQ2_XS) || defined(SRC0_IQ2_S)
+            // exp897: group l = a_part (elements 8 l .. 8 l + 7) of sub-block s, layouts as in dequant_row.hlsli (exp844)
+#if A_ELEMS != 8
+#error "exp897 IQ2 big-tile loader needs A_ELEMS 8"
+#endif
+            const uint blk = kt / 256;
+            const uint s   = (kt % 256) / 32;
+            const uint l   = a_part;
+#if defined(SRC0_IQ2_S)
+            const uint base = (a_batch + a_r * stride_01 + blk) * 82;
+            uint dbits, sc, qh, qw, sgw;
+            LOAD_U16_UNALIGNED(src0, base, dbits);
+            LOAD_U32_UNALIGNED(src0, base + 74 + s, sc);
+            LOAD_U32_UNALIGNED(src0, base + 66 + s, qh);
+            LOAD_U32_UNALIGNED(src0, base + 2 + 4 * s, qw);
+            LOAD_U32_UNALIGNED(src0, base + 34 + 4 * s, sgw);
+            const uint  gi = byte_of(qw, l) | (((qh >> (2u * l)) & 3u) << 8);
+            const uint  sg = byte_of(sgw, l);
+            const float db = f16tof32(dbits) * (0.5f + (float) ((sc >> (l < 2 ? 0u : 4u)) & 0xFu)) * 0.25f;
+            const uint  g1 = IQ2S_GRID_LO[gi];
+            const uint  g2 = IQ2S_GRID_HI[gi];
+#elif defined(SRC0_IQ2_XXS)
+            const uint base = (a_batch + a_r * stride_01 + blk) * 66;
+            uint dbits, a0, a1;
+            LOAD_U16_UNALIGNED(src0, base, dbits);
+            LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s, a0);
+            LOAD_U32_UNALIGNED(src0, base + 6 + 8 * s, a1);
+            const float db = f16tof32(dbits) * (0.5f + (float) (a1 >> 28)) * 0.25f;
+            const uint  gi = byte_of(a0, l);
+            const uint  sg = KSIGNS[(a1 >> (7u * l)) & 127u];
+            const uint  g1 = IQ2XXS_GRID_LO[gi];
+            const uint  g2 = IQ2XXS_GRID_HI[gi];
+#else
+            const uint base = (a_batch + a_r * stride_01 + blk) * 74;
+            uint dbits, sc, qw;
+            LOAD_U16_UNALIGNED(src0, base, dbits);
+            LOAD_U32_UNALIGNED(src0, base + 66 + s, sc);
+            LOAD_U32_UNALIGNED(src0, base + 2 + 8 * s + 4 * (l / 2u), qw);
+            const uint  q  = (qw >> (16u * (l & 1u))) & 0xFFFFu;
+            const uint  gi = q & 511u;
+            const uint  sg = KSIGNS[(q >> 9) & 127u];
+            const float db = f16tof32(dbits) * (0.5f + (float) ((sc >> (l < 2 ? 0u : 4u)) & 0xFu)) * 0.25f;
+            const uint  g1 = IQ2XS_GRID_LO[gi];
+            const uint  g2 = IQ2XS_GRID_HI[gi];
+#endif
+            [unroll] for (uint b = 0; b < 4; b++) {
+                vals[b]     = db * BT_IQ_SV(g1, b, sg, b);
+                vals[4 + b] = db * BT_IQ_SV(g2, b, sg, 4 + b);
+            }
+#elif defined(SRC0_Q2_K)
+            // exp897: elements e0 .. e0 + A_ELEMS - 1 of sub-block s (layout as in dequant_row.hlsli): scale/min byte 2s for e < 16,
+            // 2s + 1 for e >= 16; quant byte 16 + 32 * (s / 4) + e, shift 2 * (s % 4)
+            const uint blk  = kt / 256;
+            const uint s    = (kt % 256) / 32;
+            const uint e0   = a_part * A_ELEMS;
+            const uint base = (a_batch + a_r * stride_01 + blk) * 84;
+            uint w, scw;
+            LOAD_U32_UNALIGNED(src0, base + 80, w);
+            LOAD_U16_UNALIGNED(src0, base + 2 * s, scw);
+            const float d     = f16tof32(w & 0xFFFFu);
+            const float dmin  = f16tof32(w >> 16);
+            const uint  shift = 2u * (s % 4u);
+            const uint  qbase = base + 16 + 32 * (s / 4) + e0;
+            [unroll] for (uint j = 0; j < A_ELEMS / 4; j++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, qbase + 4 * j, q);
+                const uint  scb = (e0 + 4 * j < 16) ? (scw & 0xFFu) : (scw >> 8);
+                const float dl  = d * (float) (scb & 0xFu);
+                const float ml  = dmin * (float) (scb >> 4);
+                [unroll] for (uint b = 0; b < 4; b++) {
+                    vals[j * 4 + b] = dl * (float) ((byte_of(q, b) >> shift) & 3u) - ml;
+                }
+            }
+#elif defined(SRC0_IQ4_XS)
+            // exp882: elements e0 .. e0 + 7 of sub-block s: low nibbles of bytes 0..15 are elements 0..15, high nibbles 16..31
+#if A_ELEMS != 8
+#error "exp882 IQ4_XS big-tile loader needs A_ELEMS 8"
+#endif
+            const uint  blk  = kt / 256;
+            const uint  s    = (kt % 256) / 32;
+            const uint  base = (a_batch + a_r * stride_01 + blk) * 136;
+            const uint2 hd   = src0.Load2(base);
+            const float d    = f16tof32(hd.x & 0xFFFFu);
+            const uint  ls   = ((byte_of(hd.y, s / 2) >> (4 * (s % 2))) & 0xFu) | ((((hd.x >> 16) >> (2 * s)) & 3u) << 4);
+            const float dl   = d * ((float) ls - 32.0f);
+            const uint  e0   = a_part * 8;
+            const bool  high = e0 >= 16;
+            [unroll] for (uint j = 0; j < 2; j++) {
+                const uint q = src0.Load(base + 8 + 16 * s + (e0 % 16) + 4 * j);
+                [unroll] for (uint b = 0; b < 4; b++) {
+                    const uint byte = byte_of(q, b);
+                    vals[j * 4 + b] = dl * BT_KV_IQ4NL[high ? (byte >> 4) : (byte & 0xFu)];
                 }
             }
 #else
