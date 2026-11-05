@@ -99,6 +99,11 @@ int main(int argc, char ** argv) {
     int n_drafted = 0;
     int n_accept  = 0;
 
+    // exp990: first-pass counts (a checkpoint replay of an already verified prefix is not a new draft)
+    int  n_drafted_first = 0;
+    int  n_accept_first  = 0;
+    bool replay          = false;
+
     // used to determine end of generation
     bool has_eos = false;
 
@@ -260,6 +265,12 @@ int main(int argc, char ** argv) {
 
         GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
 
+        if (!replay) {
+            n_drafted_first += n_draft;
+            n_accept_first  += ids.size() - 1;
+        }
+        replay = false;
+
         // check for partial draft acceptance:
         // if the context doesn't support partial sequence removal, restore the checkpoint
         // and make the accepted tokens the new partial draft for the next iteration
@@ -284,6 +295,8 @@ int main(int argc, char ** argv) {
             smpl = std::move(smpl_save);
 
             n_past = (int) prompt_tgt.size();
+
+            replay = true;
 
             continue;
         }
@@ -355,6 +368,8 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+    LOG_INF("first-pass drafted = %d, accepted = %d (%.3f%%)\n", n_drafted_first, n_accept_first,
+            n_drafted_first > 0 ? 100.0f * n_accept_first / n_drafted_first : 0.0f);
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");

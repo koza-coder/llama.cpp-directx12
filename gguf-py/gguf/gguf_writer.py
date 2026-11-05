@@ -912,6 +912,9 @@ class GGUFWriter:
     def add_swiglu_clamp_exp(self, values: Sequence[float]) -> None:
         self.add_array(Keys.LLM.SWIGLU_CLAMP_EXP.format(arch=self.arch), values)
 
+    def add_swiglu_clamp(self, values: Sequence[float]) -> None:
+        self.add_array(Keys.LLM.SWIGLU_CLAMP.format(arch=self.arch), values)
+
     def add_swiglu_clamp_shexp(self, values: Sequence[float]) -> None:
         self.add_array(Keys.LLM.SWIGLU_CLAMP_SHEXP.format(arch=self.arch), values)
 
@@ -974,6 +977,18 @@ class GGUFWriter:
 
     def add_hrm_prefix_lm(self, value: bool) -> None:
         self.add_bool(Keys.HRM.PREFIX_LM.format(arch=self.arch), value)
+
+    def add_metis_pass_count(self, value: int) -> None:
+        self.add_uint32(Keys.Metis.PASS_COUNT.format(arch=self.arch), value)
+
+    def add_metis_memory_length(self, value: int) -> None:
+        self.add_uint32(Keys.Metis.MEMORY_LENGTH.format(arch=self.arch), value)
+
+    def add_metis_route_length(self, value: int) -> None:
+        self.add_uint32(Keys.Metis.ROUTE_LENGTH.format(arch=self.arch), value)
+
+    def add_metis_continuation_logit_limit(self, value: float) -> None:
+        self.add_float32(Keys.Metis.CONTINUATION_LOGIT_LIMIT.format(arch=self.arch), value)
 
     def add_adapter_count(self, count: int) -> None:
         self.add_uint32(Keys.Adapters.COUNT.format(arch=self.arch), count)
@@ -1086,6 +1101,9 @@ class GGUFWriter:
     def add_attention_output_lora_rank(self, length: int) -> None:
         self.add_uint32(Keys.Attention.OUTPUT_LORA_RANK.format(arch=self.arch), length)
 
+    def add_attention_pass_lora_rank(self, length: int) -> None:
+        self.add_uint32(Keys.Attention.PASS_LORA_RANK.format(arch=self.arch), length)
+
     def add_attention_compress_ratios(self, values: Sequence[int]) -> None:
         self.add_array(Keys.Attention.COMPRESS_RATIOS.format(arch=self.arch), values)
 
@@ -1184,6 +1202,9 @@ class GGUFWriter:
     def add_realtime_delay_tokens(self, value: int) -> None:
         self.add_uint32(Keys.LLM.REALTIME_DELAY_TOKENS.format(arch=self.arch), value)
 
+    def add_classifier_free_guidance(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.CLASSIFIER_FREE_GUIDANCE.format(arch=self.arch), value)
+
     def add_pooling_type(self, value: PoolingType) -> None:
         self.add_uint32(Keys.LLM.POOLING_TYPE.format(arch=self.arch), value.value)
 
@@ -1266,6 +1287,9 @@ class GGUFWriter:
 
     def add_ssm_dt_b_c_rms(self, value: bool) -> None:
         self.add_bool(Keys.SSM.DT_B_C_RMS.format(arch=self.arch), value)
+
+    def add_ssm_norm_epsilon(self, value: float) -> None:
+        self.add_float32(Keys.SSM.NORM_EPSILON.format(arch=self.arch), value)
 
     def add_expert_latent_length(self, value: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_LATENT_LENGTH.format(arch=self.arch), value)
@@ -1712,6 +1736,15 @@ class GGUFWriter:
     def add_audio_projector_head_count(self, value: int) -> None:
         self.add_uint32(Keys.ClipAudio.Projector.HEAD_COUNT, value)
 
+    def add_audio_rope_dims(self, value: int) -> None:
+        self.add_uint32(Keys.ClipAudio.ROPE_DIMS, value)
+
+    def add_audio_spk_block_count(self, value: int) -> None:
+        self.add_uint32(Keys.ClipAudio.Speaker.BLOCK_COUNT, value)
+
+    def add_audio_spk_head_count(self, value: int) -> None:
+        self.add_uint32(Keys.ClipAudio.Speaker.HEAD_COUNT, value)
+
     # audio generation (mmproj)
 
     def add_clip_gen_audio_projector_type(self, value: str) -> None:
@@ -1808,6 +1841,27 @@ class GGUFWriter:
 
     def add_diffusion_shift_logits(self, value: bool) -> None:
         self.add_bool(Keys.Diffusion.SHIFT_LOGITS, value)
+
+    def add_diffusion_canvas_length(self, value: int) -> None:
+        self.add_uint32(Keys.Diffusion.CANVAS_LENGTH, value)
+
+    def add_diffusion_eb_max_steps(self, value: int) -> None:
+        self.add_uint32(Keys.Diffusion.EB_MAX_STEPS, value)
+
+    def add_diffusion_eb_t_min(self, value: float) -> None:
+        self.add_float32(Keys.Diffusion.EB_T_MIN, value)
+
+    def add_diffusion_eb_t_max(self, value: float) -> None:
+        self.add_float32(Keys.Diffusion.EB_T_MAX, value)
+
+    def add_diffusion_eb_entropy_bound(self, value: float) -> None:
+        self.add_float32(Keys.Diffusion.EB_ENTROPY_BOUND, value)
+
+    def add_diffusion_eb_stability_threshold(self, value: int) -> None:
+        self.add_uint32(Keys.Diffusion.EB_STABILITY, value)
+
+    def add_diffusion_eb_confidence_threshold(self, value: float) -> None:
+        self.add_float32(Keys.Diffusion.EB_CONFIDENCE, value)
 
     def _pack(self, fmt: str, value: Any, skip_pack_prefix: bool = False) -> bytes:
         pack_prefix = ''
