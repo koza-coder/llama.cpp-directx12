@@ -1339,7 +1339,7 @@ static void ggml_d3d12_cpy(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tenso
         return;
     }
     std::vector<std::string> defines = { ggml_d3d12_type_define(src->type, "SRC"), ggml_d3d12_type_define(dst->type, "DST") };
-    if (src->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F16) {
+    if (src->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16) {
         defines.push_back("USE_16BIT");
     }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "cpy", hlsl_cpy, defines);
@@ -5103,6 +5103,7 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
         case GGML_OP_DUP:
             return (type_ok(op->type) && type_ok(src0->type)) ||
                    (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_BF16 && ggml_nelements(op) <= UINT32_MAX) ||
+                   (op->type == GGML_TYPE_BF16 && src0->type == GGML_TYPE_F32 && ctx->caps.native_16bit && ggml_nelements(op) <= UINT32_MAX) ||
                    ggml_d3d12_cpy_dequant_type(src0, op) || ggml_d3d12_cpy_quantize_type(src0, op) ||
                    (ggml_d3d12_cpy_raw_type(ctx->caps, src0, op) && ggml_nelements(op) <= UINT32_MAX);
         case GGML_OP_ADD:
