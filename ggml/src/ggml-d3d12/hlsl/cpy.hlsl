@@ -1,6 +1,7 @@
 #include "common.hlsli"
 
-// defines: SRC_{F32,F16,BF16,I32}, DST_{F32,F16,I32}
+// defines: SRC_{F32,F16,BF16,I32}, DST_{F32,F16,BF16,I32}; F16 and BF16 dst need USE_16BIT
+// f32 -> bf16: round to nearest even, a NaN stays a NaN (as set_rows.hlsl)
 
 #if defined(SRC_F32)
 #define SRC_T float
@@ -23,6 +24,16 @@ float load_bf16_src(uint i);
 #elif defined(DST_F16)
 #define DST_T float
 #define STORE_DST(i, v) STORE_F16(dst, i, v)
+#elif defined(DST_BF16)
+#define DST_T float
+uint f32_to_bf16_bits(float f) {
+    const uint x = asuint(f);
+    if ((x & 0x7FFFFFFFu) > 0x7F800000u) {
+        return (x >> 16) | 0x40u;
+    }
+    return (x + 0x7FFFu + ((x >> 16) & 1u)) >> 16;
+}
+#define STORE_DST(i, v) dst.Store<uint16_t>((i) * 2, (uint16_t) f32_to_bf16_bits(v))
 #elif defined(DST_I32)
 #define DST_T int
 #define STORE_DST(i, v) STORE_I32(dst, i, v)
