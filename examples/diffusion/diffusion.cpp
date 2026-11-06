@@ -581,6 +581,9 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
 
         // per position: argmax, entropy of softmax(raw/t), and a multinomial sample; stash raw row for SC
         auto worker = [&](int32_t p0, int32_t p1) {
+            // exp1054: each exp is computed once and kept, entropy = log Z - sum(e * (z - m)) / Z, the sample pass stops
+            // at the target; same expf values in the same order, so argmax and the sampled token are unchanged
+            std::vector<float> ebuf(n_vocab);
             for (int32_t pos = p0; pos < p1; pos++) {
                 const float * row = logits + (size_t) pos * n_vocab;
                 float m = -INFINITY; int32_t amax = 0;
@@ -588,19 +591,22 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
                     const float z = row[v] * temp_inv;
                     if (z > m) { m = z; amax = v; }
                 }
-                float Z = 0.0f;
+                float  Z  = 0.0f;
+                double Sd = 0.0;
                 for (int32_t v = 0; v < n_vocab; v++) {
-                    Z += expf(row[v] * temp_inv - m);
+                    const float d = row[v] * temp_inv - m;
+                    const float e = expf(d);
+                    ebuf[v] = e;
+                    Z  += e;
+                    Sd += (double) e * d;
                 }
+                const float H      = Z > 0.0f ? logf(Z) - (float) (Sd / Z) : 0.0f;
                 const float target = u[pos] * Z;
-                float   cum = 0.0f, H = 0.0f;
-                int32_t sampled = n_vocab - 1; bool picked = false;
+                float   cum = 0.0f;
+                int32_t sampled = n_vocab - 1;
                 for (int32_t v = 0; v < n_vocab; v++) {
-                    const float e = expf(row[v] * temp_inv - m);
-                    const float p = e / Z;
-                    if (p > 0.0f) { H -= p * logf(p); }
-                    cum += e;
-                    if (!picked && cum >= target) { sampled = v; picked = true; }
+                    cum += ebuf[v];
+                    if (cum >= target) { sampled = v; break; }
                 }
                 entropy[pos]       = H;
                 argmax_canvas[pos] = amax;
