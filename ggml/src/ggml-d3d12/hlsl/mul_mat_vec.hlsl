@@ -12,7 +12,11 @@
 //          FUSE_ADD (per-matrix optional addend, broadcast over dims 1..3 like ggml_add)
 // src0 offsets/strides are in elements for float types and in blocks for quant types.
 
+#if defined(NCOLS) && NCOLS > 4
+#define MAX_COLS NCOLS   // exp885: 5..8 columns in one dispatch
+#else
 #define MAX_COLS 4
+#endif
 
 #define ROWS (WG_SIZE / TPR)
 #if defined(RPT2)
@@ -189,7 +193,14 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         src1_base[c] = offset_src1 + dst3_idx * stride_13 + dst2_idx * stride_12 + (col0 + c) * stride_11;
     }
 #endif
+#if MAX_COLS > 4
+    float acc[MAX_COLS];
+    [unroll] for (uint c6 = 0; c6 < MAX_COLS; c6++) {
+        acc[c6] = 0.0f;
+    }
+#else
     float acc[MAX_COLS] = { 0, 0, 0, 0 };
+#endif
 #if defined(RPT2)
     float acc2[MAX_COLS] = { 0, 0, 0, 0 };
     const uint row2       = row + ROWS;
@@ -249,13 +260,27 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
         GroupMemoryBarrierWithGroupSync();
     }
+#if MAX_COLS > 4
+    float row_result[MAX_COLS];
+    [unroll] for (uint c7 = 0; c7 < MAX_COLS; c7++) {
+        row_result[c7] = partial[c7][tid];
+    }
+#else
     const float4 row_result = float4(partial[0][tid], partial[1][tid], partial[2][tid], partial[3][tid]);
+#endif
 #if defined(RPT2)
     const float  row_result2 = partial2[tid];
 #endif
 #else
     // one thread per row: no shared memory and no barriers
+#if MAX_COLS > 4
+    float row_result[MAX_COLS];
+    [unroll] for (uint c8 = 0; c8 < MAX_COLS; c8++) {
+        row_result[c8] = acc[c8];
+    }
+#else
     const float4 row_result = float4(acc[0], acc[1], acc[2], acc[3]);
+#endif
 #if defined(RPT2)
     const float  row_result2 = acc2[0];
 #endif

@@ -396,6 +396,50 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         }
         acc[0] += d * (float) sc * sq - dmin * (float) mn * sy;
     }
+#elif defined(SRC0_Q6_K) && defined(NCOLS) && defined(Q6K_V2) && !defined(SRC1_F16)
+    // exp973: the exp972 unit (8 consecutive l of one half block = 32 weights, every quant byte loaded once), decoded once into
+    // registers with the scales folded in, then dotted with each of the NCOLS columns
+    for (uint u = lane; u < k / 32; u += TPR) {
+        const uint blk  = u / 8;
+        const uint hf   = (u / 4) % 2;
+        const uint l0   = (u % 4) * 8;
+        const uint is   = l0 / 16;
+        const uint base = (src0_base + blk) * 210;
+        const uint ph   = base & 2u;
+        uint dbits;
+        LOAD_U16_UNALIGNED(src0, base + 208, dbits);
+        const float d  = f16tof32(dbits);
+        const uint3 wa = src0.Load3((base + 64 * hf + l0) & ~3u);
+        const uint3 wb = src0.Load3((base + 64 * hf + 32 + l0) & ~3u);
+        const uint3 wh = src0.Load3((base + 128 + 32 * hf + l0) & ~3u);
+        const uint3 ws = src0.Load3((base + 192 + 8 * hf) & ~3u);
+        const uint  A[2] = { ph != 0 ? ((wa.x >> 16) | (wa.y << 16)) : wa.x, ph != 0 ? ((wa.y >> 16) | (wa.z << 16)) : wa.y };
+        const uint  Bq[2] = { ph != 0 ? ((wb.x >> 16) | (wb.y << 16)) : wb.x, ph != 0 ? ((wb.y >> 16) | (wb.z << 16)) : wb.y };
+        const uint  Hq[2] = { ph != 0 ? ((wh.x >> 16) | (wh.y << 16)) : wh.x, ph != 0 ? ((wh.y >> 16) | (wh.z << 16)) : wh.y };
+        const uint  s0 = ph != 0 ? ((ws.x >> 16) | (ws.y << 16)) : ws.x;
+        const uint  s1 = ph != 0 ? ((ws.y >> 16) | (ws.z << 16)) : ws.y;
+        const float f1 = d * (float) sbyte_of(s0, is), f2 = d * (float) sbyte_of(s0, is + 2);
+        const float f3 = d * (float) sbyte_of(s1, is), f4 = d * (float) sbyte_of(s1, is + 2);
+        float4 w1[2], w2[2], w3[2], w4[2];
+        [unroll] for (uint w = 0; w < 2; w++) {
+            [unroll] for (uint e = 0; e < 4; e++) {
+                const uint la = byte_of(A[w], e), lb = byte_of(Bq[w], e), hh = byte_of(Hq[w], e);
+                w1[w][e] = f1 * (float) ((int) ((la & 0xFu) | ((hh & 3u) << 4)) - 32);
+                w2[w][e] = f2 * (float) ((int) ((lb & 0xFu) | (((hh >> 2) & 3u) << 4)) - 32);
+                w3[w][e] = f3 * (float) ((int) ((la >> 4) | (((hh >> 4) & 3u) << 4)) - 32);
+                w4[w][e] = f4 * (float) ((int) ((lb >> 4) | (((hh >> 6) & 3u) << 4)) - 32);
+            }
+        }
+        [unroll] for (uint cc = 0; cc < NCOLS; cc++) {
+            const uint ys = (src1_base[cc] + blk * 256 + hf * 128 + l0) * 4;
+            float p = 0.0f;
+            [unroll] for (uint w = 0; w < 2; w++) {
+                p += dot(w1[w], asfloat(src1.Load4(ys + 16 * w)))       + dot(w2[w], asfloat(src1.Load4(ys + 128 + 16 * w))) +
+                     dot(w3[w], asfloat(src1.Load4(ys + 256 + 16 * w))) + dot(w4[w], asfloat(src1.Load4(ys + 384 + 16 * w)));
+            }
+            acc[cc] += p;
+        }
+    }
 #elif defined(SRC0_Q6_K) && defined(NCOLS) && !defined(SRC1_F16)
     // single column: ql and qh as 36-byte windows (2x Load4 + Load; 210-byte blocks start on 2 bytes), src1 as Load4s
     for (uint sb = lane; sb < k / 32; sb += TPR) {
@@ -439,6 +483,53 @@ void dot_row(RWByteAddressBuffer src0, uint src0_base, uint lane, uint ncols, ui
         }
         acc[cc] += d * ((float) sbyte_of(scw, 0) * sum0 + (float) sbyte_of(scw, 1) * sum1);
         }
+    }
+#elif defined(SRC0_Q6_K) && defined(ONE_COL) && defined(Q6K_V2) && !defined(SRC1_F16)
+    // exp972: unit = 8 consecutive l of one half block (8 units per block, k / 32 per row): ql[l..l+7], ql[l+32..l+39] and qh[l..l+7]
+    // hold 32 weights (y[l], y[l+32], y[l+64], y[l+96] for 8 l), so every quant byte is loaded once; 8-byte windows as one Load3
+    // (210-byte blocks start on 2 bytes), the 8 scale bytes of the half the same way, src1 as 8 Load4s
+    for (uint u = lane; u < k / 32; u += TPR) {
+        const uint blk  = u / 8;
+        const uint hf   = (u / 4) % 2;
+        const uint l0   = (u % 4) * 8;
+        const uint is   = l0 / 16;
+        const uint base = (src0_base + blk) * 210;
+        const uint ph   = base & 2u;   // every window below shares base's 4-byte phase
+        uint dbits;
+        LOAD_U16_UNALIGNED(src0, base + 208, dbits);
+        const float d  = f16tof32(dbits);
+        const uint3 wa = src0.Load3((base + 64 * hf + l0) & ~3u);
+        const uint3 wb = src0.Load3((base + 64 * hf + 32 + l0) & ~3u);
+        const uint3 wh = src0.Load3((base + 128 + 32 * hf + l0) & ~3u);
+        const uint3 ws = src0.Load3((base + 192 + 8 * hf) & ~3u);
+        const uint  a0 = ph != 0 ? ((wa.x >> 16) | (wa.y << 16)) : wa.x;
+        const uint  a1 = ph != 0 ? ((wa.y >> 16) | (wa.z << 16)) : wa.y;
+        const uint  b0 = ph != 0 ? ((wb.x >> 16) | (wb.y << 16)) : wb.x;
+        const uint  b1 = ph != 0 ? ((wb.y >> 16) | (wb.z << 16)) : wb.y;
+        const uint  h0 = ph != 0 ? ((wh.x >> 16) | (wh.y << 16)) : wh.x;
+        const uint  h1 = ph != 0 ? ((wh.y >> 16) | (wh.z << 16)) : wh.y;
+        const uint  s0 = ph != 0 ? ((ws.x >> 16) | (ws.y << 16)) : ws.x;   // sc[0..3] of the half
+        const uint  s1 = ph != 0 ? ((ws.y >> 16) | (ws.z << 16)) : ws.y;   // sc[4..7]
+        const uint  ys = (src1_base[0] + blk * 256 + hf * 128 + l0) * 4;
+        float q1 = 0.0f, q2 = 0.0f, q3 = 0.0f, q4 = 0.0f;
+        [unroll] for (uint w = 0; w < 2; w++) {
+            const uint   a  = w == 0 ? a0 : a1;
+            const uint   b  = w == 0 ? b0 : b1;
+            const uint   hb = w == 0 ? h0 : h1;
+            const float4 y1 = asfloat(src1.Load4(ys + 16 * w));
+            const float4 y2 = asfloat(src1.Load4(ys + 128 + 16 * w));
+            const float4 y3 = asfloat(src1.Load4(ys + 256 + 16 * w));
+            const float4 y4 = asfloat(src1.Load4(ys + 384 + 16 * w));
+            [unroll] for (uint e = 0; e < 4; e++) {
+                const uint la = byte_of(a, e), lb = byte_of(b, e), hh = byte_of(hb, e);
+                q1 += (float) ((int) ((la & 0xFu) | ((hh & 3u) << 4)) - 32) * y1[e];
+                q2 += (float) ((int) ((lb & 0xFu) | (((hh >> 2) & 3u) << 4)) - 32) * y2[e];
+                q3 += (float) ((int) ((la >> 4) | (((hh >> 4) & 3u) << 4)) - 32) * y3[e];
+                q4 += (float) ((int) ((lb >> 4) | (((hh >> 6) & 3u) << 4)) - 32) * y4[e];
+            }
+        }
+        acc[0] += d * ((float) sbyte_of(s0, is) * q1 + (float) sbyte_of(s0, is + 2) * q2 +
+                       (float) sbyte_of(s1, is) * q3 + (float) sbyte_of(s1, is + 2) * q4);
     }
 #elif defined(SRC0_Q6_K) && defined(ONE_COL) && !defined(SRC1_F16)
     // single column: ql and qh as 36-byte windows (2x Load4 + Load; 210-byte blocks start on 2 bytes), src1 as Load4s
