@@ -1339,7 +1339,7 @@ static void ggml_d3d12_cpy(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tenso
         return;
     }
     std::vector<std::string> defines = { ggml_d3d12_type_define(src->type, "SRC"), ggml_d3d12_type_define(dst->type, "DST") };
-    if (src->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F16) {
+    if (src->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16) {
         defines.push_back("USE_16BIT");
     }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "cpy", hlsl_cpy, defines);
@@ -3960,7 +3960,7 @@ static void ggml_d3d12_rope(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_ten
     memcpy(sections, (int32_t *) dst->op_params + 11, 4 * sizeof(int));
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
     float corr_dims[2];
-    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(dst), corr_dims);
 
     const uint32_t n_threads = (uint32_t) (ggml_nelements(src0) / 2);
     std::vector<uint32_t> params = {
@@ -5103,6 +5103,7 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
         case GGML_OP_DUP:
             return (type_ok(op->type) && type_ok(src0->type)) ||
                    (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_BF16 && ggml_nelements(op) <= UINT32_MAX) ||
+                   (op->type == GGML_TYPE_BF16 && src0->type == GGML_TYPE_F32 && ctx->caps.native_16bit && ggml_nelements(op) <= UINT32_MAX) ||
                    ggml_d3d12_cpy_dequant_type(src0, op) || ggml_d3d12_cpy_quantize_type(src0, op) ||
                    (ggml_d3d12_cpy_raw_type(ctx->caps, src0, op) && ggml_nelements(op) <= UINT32_MAX);
         case GGML_OP_ADD:
@@ -5523,6 +5524,10 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                    src1->type == op->type && ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+                if (op->src[5] != nullptr) {
+                    return false;
+                }
                 // f32/f16 KV, f16 mask, head sizes up to 576 and multiples of 4; contiguous rows and a contiguous dst
                 const ggml_tensor * k = op->src[1];
                 const ggml_tensor * v = op->src[2];
