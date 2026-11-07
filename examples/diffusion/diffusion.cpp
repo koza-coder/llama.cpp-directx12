@@ -14,6 +14,36 @@
 #include <utility>
 #include <vector>
 
+// exp1066: exp of 4 floats at once for d <= 0 (Cephes expf polynomial, rel. err ~1.2e-7; d < -87 gives 0)
+#if defined(__GNUC__) || defined(__clang__)
+#define DIFFUSION_VEXP 1
+typedef float   diffusion_v4f __attribute__((vector_size(16)));
+typedef int32_t diffusion_v4i __attribute__((vector_size(16)));
+static inline diffusion_v4f diffusion_vexp_neg(diffusion_v4f x) {
+    const diffusion_v4f lo   = { -87.0f, -87.0f, -87.0f, -87.0f };
+    const diffusion_v4i dead = x < lo;
+    x = x < lo ? lo : x;
+    const diffusion_v4f t  = x * 1.44269504088896341f + 0.5f;
+    diffusion_v4i       n  = __builtin_convertvector(t, diffusion_v4i);
+    const diffusion_v4f n0 = __builtin_convertvector(n, diffusion_v4f);
+    n = n0 > t ? n - 1 : n;   // floor
+    const diffusion_v4f nf = __builtin_convertvector(n, diffusion_v4f);
+    diffusion_v4f r = x - nf * 0.693359375f;
+    r = r - nf * -2.12194440e-4f;
+    diffusion_v4f q = r * 1.9875691500e-4f + 1.3981999507e-3f;
+    q = q * r + 8.3334519073e-3f;
+    q = q * r + 4.1665795894e-2f;
+    q = q * r + 1.6666665459e-1f;
+    q = q * r + 5.0000001201e-1f;
+    q = q * r * r + r + 1.0f;
+    const diffusion_v4i bits = (n + 127) << 23;
+    diffusion_v4f       s;
+    std::memcpy(&s, &bits, sizeof(s));
+    const diffusion_v4f zero = { 0.0f, 0.0f, 0.0f, 0.0f };
+    return dead ? zero : q * s;
+}
+#endif
+
 static float calculate_confidence(const llama_token_data_array & cur_p,
                                   diffusion_algorithm            algorithm,
                                   std::mt19937 &                 rng) {
@@ -591,18 +621,37 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
                     const float z = row[v] * temp_inv;
                     if (z > m) { m = z; amax = v; }
                 }
-                float  Z  = 0.0f;
+                // exp1066: 4 exps at once; lane sums folded into double every 4096 values, cumulative pass in double
+                double Zd = 0.0;
                 double Sd = 0.0;
-                for (int32_t v = 0; v < n_vocab; v++) {
+                int32_t v0 = 0;
+#ifdef DIFFUSION_VEXP
+                for (; v0 + 4096 <= n_vocab; v0 += 4096) {
+                    diffusion_v4f cz = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    diffusion_v4f cs = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    for (int32_t v = v0; v < v0 + 4096; v += 4) {
+                        diffusion_v4f z;
+                        std::memcpy(&z, row + v, sizeof(z));
+                        const diffusion_v4f d = z * temp_inv - m;
+                        const diffusion_v4f e = diffusion_vexp_neg(d);
+                        std::memcpy(ebuf.data() + v, &e, sizeof(e));
+                        cz += e;
+                        cs += e * d;
+                    }
+                    Zd += (double) cz[0] + cz[1] + cz[2] + cz[3];
+                    Sd += (double) cs[0] + cs[1] + cs[2] + cs[3];
+                }
+#endif
+                for (int32_t v = v0; v < n_vocab; v++) {
                     const float d = row[v] * temp_inv - m;
                     const float e = expf(d);
                     ebuf[v] = e;
-                    Z  += e;
+                    Zd += e;
                     Sd += (double) e * d;
                 }
-                const float H      = Z > 0.0f ? logf(Z) - (float) (Sd / Z) : 0.0f;
-                const float target = u[pos] * Z;
-                float   cum = 0.0f;
+                const float  H      = Zd > 0.0 ? (float) (log(Zd) - Sd / Zd) : 0.0f;
+                const double target = u[pos] * Zd;
+                double  cum = 0.0;
                 int32_t sampled = n_vocab - 1;
                 for (int32_t v = 0; v < n_vocab; v++) {
                     cum += ebuf[v];
