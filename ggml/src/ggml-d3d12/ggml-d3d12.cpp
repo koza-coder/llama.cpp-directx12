@@ -4885,6 +4885,9 @@ static ggml_backend_buffer_i ggml_backend_d3d12_buffer_interface = {
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_d3d12_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 /* GGML Backend Buffer Type Interface */
