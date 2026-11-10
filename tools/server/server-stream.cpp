@@ -62,7 +62,9 @@ private:
 };
 
 // process wide manager, lifecycle controlled by llama-server main() via start_gc/stop_gc
-static stream_session_manager g_stream_sessions;
+// heap allocated and never destroyed: a static destructor that joins the GC thread deadlocks at process exit when this code lives in a
+// DLL (loader lock held, e.g. llama-server --help on a shared build). clean_up() calls stop_gc() on the normal path.
+static stream_session_manager & g_stream_sessions = *new stream_session_manager();
 
 void server_stream_session_manager_start() {
     g_stream_sessions.start_gc();
