@@ -169,6 +169,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MAION_CODER,      "maion-coder"      },
     { LLM_ARCH_KIMI_LINEAR,      "kimi-linear"      },
     { LLM_ARCH_KIMI_K3,          "kimi-k3"          },
+    { LLM_ARCH_KIMI_K31,         "kimi-k31"         },
     { LLM_ARCH_GLM5_NEXT,        "glm5-next"        },
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
@@ -1385,6 +1386,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_KIMI_K31:
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
@@ -1415,6 +1417,7 @@ bool llm_arch_is_diffusion(const llm_arch & arch) {
 bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_KIMI_K31:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_CLOVER_MOE:
@@ -1487,6 +1490,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_KIMI_K31:
         case LLM_ARCH_QWEN3TTS:
         case LLM_ARCH_LIMITE:
             return false;
