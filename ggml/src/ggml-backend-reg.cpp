@@ -497,6 +497,8 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
 #endif
         // default search paths: executable directory, current directory
         search_paths.push_back(get_executable_path());
+        // dispatch layout: the CPU variants (ggml-cpu-<variant>.dll) may sit in <executable dir>/cpu
+        search_paths.push_back(get_executable_path() / "cpu");
         std::error_code cwd_ec;
         const fs::path cwd = fs::current_path(cwd_ec);
         if (cwd_ec) {
