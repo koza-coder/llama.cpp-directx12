@@ -25,7 +25,7 @@
 // exp617/exp622: integer-dot variant of the BIG_TILE kernel. Weights stay quantized (Q4_0 nibbles - 8, or Q8_0 bytes) and are packed 4 per word;
 // the f32 columns are quantized to int8 per 32-block (Q8_0 style, scale = amax / 127) while they are staged; the 32-element block product is
 // 8 dot4add_i8packed per output and one scale multiply-add. Needs SM 6.4. Tile 128 x 64 (8 x 4 per thread) or 64 x 32 (4 x 2).
-#if defined(SRC0_Q4_K)
+#if defined(SRC0_Q4_K) || defined(SRC0_Q5_K)
 #define A_MODE 1        // value = dl * q - ml (q 0..15): sum = dl * isum - ml * (sum of the int8 column values)
 #elif defined(SRC0_Q6_K)
 #define A_MODE 2        // value = d * sc * (q - 32), one scale per 16 values: sum = sc0 * isum(0..15) + sc1 * isum(16..31)
@@ -163,6 +163,39 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                     uint q;
                     LOAD_U32_UNALIGNED(src0, qbase + 4 * j, q);
                     aw[j] = (q >> shift) & 0x0F0F0F0Fu;
+                }
+#elif defined(SRC0_Q5_K)
+                // exp1103: super-block of 256 (176 bytes): f16 d, f16 dmin, 12 bytes of scales/mins (as Q4_K), 32 bytes qh, 128 bytes qs.
+                // sub-block s: low 4 bits = nibble (s & 1) of qs[32 * (s / 2) + l], bit 4 = bit s of qh[l] (l = 0..31)
+                const uint blk  = kt / 256;
+                const uint s    = (kt % 256) / 32;
+                const uint base = (a_batch + a_r * stride_01 + blk) * 176;
+                uint w;
+                LOAD_U32_UNALIGNED(src0, base, w);
+                const float d    = f16tof32(w & 0xFFFFu);
+                const float dmin = f16tof32(w >> 16);
+                uint sc0, sc1, sc2;
+                LOAD_U32_UNALIGNED(src0, base + 4, sc0);
+                LOAD_U32_UNALIGNED(src0, base + 8, sc1);
+                LOAD_U32_UNALIGNED(src0, base + 12, sc2);
+                uint sc, mn;
+                if (s < 4) {
+                    sc = byte_of(sc0, s) & 63u;
+                    mn = byte_of(sc1, s) & 63u;
+                } else {
+                    sc = (byte_of(sc2, s - 4) & 0xFu) | ((byte_of(sc0, s - 4) >> 6) << 4);
+                    mn = (byte_of(sc2, s - 4) >> 4) | ((byte_of(sc1, s - 4) >> 6) << 4);
+                }
+                ad = d * (float) sc;
+                am = dmin * (float) mn;
+                const uint shift  = (s & 1u) * 4u;
+                const uint qbase  = base + 48 + 32 * (s / 2) + 16 * a_part;
+                const uint qhbase = base + 16 + 16 * a_part;
+                [unroll] for (uint j = 0; j < A_WORDS; j++) {
+                    uint q, qh;
+                    LOAD_U32_UNALIGNED(src0, qbase + 4 * j, q);
+                    LOAD_U32_UNALIGNED(src0, qhbase + 4 * j, qh);
+                    aw[j] = ((q >> shift) & 0x0F0F0F0Fu) | (((qh >> s) & 0x01010101u) << 4);
                 }
 #elif defined(SRC0_Q6_K)
                 // super-block of 256: 128 bytes ql, 64 bytes qh, 16 int8 scales, f16 d; the two threads of a row take one scale each
@@ -924,7 +957,7 @@ cbuffer Params : register(b0) {
 groupshared float Atile[TILE_K][TILE_M];
 groupshared float Btile[TILE_K][TILE_N];
 
-#if !defined(SRC0_F32) && !defined(SRC0_F16) && !defined(SRC0_Q8_0) && !defined(SRC0_Q4_0) && \
+#if !defined(SRC0_F32) && !defined(SRC0_F16) && !defined(SRC0_BF16) && !defined(SRC0_Q8_0) && !defined(SRC0_Q4_0) && \
     !defined(SRC0_Q4_K) && !defined(SRC0_Q6_K)
 // dot_row with lane = block number and a TPR above any block count runs its loop once, for that
 // block only. ACC then writes each value straight into the Atile column of this thread.
@@ -995,6 +1028,14 @@ void load_a_row(uint row_base, uint k0, out float vals[TILE_K]) {
         LOAD_U32_UNALIGNED(src0, (row_base + k0 + i) * 2, w);
         vals[i + 0] = f16tof32(w & 0xFFFFu);
         vals[i + 1] = f16tof32(w >> 16);
+    }
+#elif defined(SRC0_BF16)
+    // exp1099: bf16 = the high 16 bits of an f32; K % 32 == 0 here (no K_TAIL for BF16)
+    [unroll] for (uint i = 0; i < TILE_K; i += 2) {
+        uint w;
+        LOAD_U32_UNALIGNED(src0, (row_base + k0 + i) * 2, w);
+        vals[i + 0] = asfloat(w << 16);
+        vals[i + 1] = asfloat(w & 0xFFFF0000u);
     }
 #elif defined(SRC0_Q8_0)
     // block: f16 d, 32 int8
