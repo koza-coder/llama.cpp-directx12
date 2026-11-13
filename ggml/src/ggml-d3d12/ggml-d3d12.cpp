@@ -1593,6 +1593,11 @@ static bool ggml_d3d12_tiled_type(ggml_type t) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
             return true;
+        case GGML_TYPE_BF16: {
+            // exp1099: BF16 prompt products on the tiled kernel (GGML_D3D12_TILED_BF16=0 keeps them on the mat-vec kernel)
+            static const bool on = [] { const char * e = getenv("GGML_D3D12_TILED_BF16"); return e ? atoi(e) != 0 : true; }();
+            return on;
+        }
         default:
             return false;
     }
@@ -1667,8 +1672,11 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     // exp895: on Moore Threads the big tile from 16 columns (16..31-token chat prompts: one partly filled tile instead of the old tiled kernel)
     static const char * btmin_env = getenv("GGML_D3D12_BT_MIN");
     const uint32_t bt_min = btmin_env ? (uint32_t) std::max(1, atoi(btmin_env)) : dev.vendor_id == 0x1ED5 ? 16u : bt_tn;
+    // exp1103: Q5_K in the DP4a big tile (GGML_D3D12_BT_Q5K=0 turns it off)
+    static const char * q5k_env = getenv("GGML_D3D12_BT_Q5K");
+    const bool q5k_dp4a = dp4a_ok && bt_wide && (q5k_env ? atoi(q5k_env) != 0 : true);
     const bool big = bt_on && (uint32_t) dst->ne[1] >= bt_min &&
-                     (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 ||
+                     (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 || (q5k_dp4a && src0->type == GGML_TYPE_Q5_K) ||
                       ((dp4a_ok && bt_wide) || kq_fp32) && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) ||
                       iq_fp32 && (src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ4_XS) ||
                       iq2_fp32 && (src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ2_S ||
