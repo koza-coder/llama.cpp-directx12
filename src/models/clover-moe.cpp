@@ -578,7 +578,6 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn_linear(
     k_conv = build_clover_l2_norm(k_conv, false);
 
     const bool repeat_heads = num_k_heads != num_v_heads;
-    const bool fused_gdn = cparams.fused_gdn_ar && cparams.fused_gdn_ch;
     if (repeat_heads) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
     }
@@ -590,7 +589,8 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn_linear(
             q = build_bf16_round(q);
             k = build_bf16_round(k);
         }
-        if (repeat_heads && (is_prefill || !fused_gdn)) {
+        // upstream ccd360f06: the fused gated delta net is always used; it broadcasts k heads, prefill keeps the explicit repeat
+        if (repeat_heads && is_prefill) {
             q = ggml_repeat_4d(ctx0, q, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
             k = ggml_repeat_4d(ctx0, k, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         }
