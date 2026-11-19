@@ -1718,6 +1718,14 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     if (!big && ggml_d3d12_iq_split(dev, src0->type)) {
         defines.push_back("IQ_SPLIT_ON");   // exp848
     }
+    // exp1165: classic kernel with 128 rows per workgroup for the A_STAGE4 types except Q6_K, as in the DX11 kernel (exp1164:
+    // SmolVLA F16 weights 928 -> DX11 452 us per dispatch on Iris Xe). GGML_D3D12_TILE_M=64 restores the old tile.
+    static const int tm_env = [] { const char * e = getenv("GGML_D3D12_TILE_M"); return e ? atoi(e) : 128; }();
+    const uint32_t tile_m = !big && tm_env == 128 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_Q8_0 ||
+                                                      src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_K) ? 128u : 64u;
+    if (tile_m != 64) {
+        defines.push_back("TILE_M=" + std::to_string(tile_m));
+    }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines,
                                                         use_dp4a ? D3D_SHADER_MODEL_6_4 : D3D_SHADER_MODEL_6_0);
 
@@ -1740,7 +1748,7 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     };
 
     // tile sizes must match TILE_M and TILE_N in mul_mat_tiled.hlsl
-    const uint32_t tiles_m  = CEIL_DIV((uint32_t) dst->ne[0], big ? bt_tm : 64u);
+    const uint32_t tiles_m  = CEIL_DIV((uint32_t) dst->ne[0], big ? bt_tm : tile_m);
     const uint32_t tiles_n  = CEIL_DIV((uint32_t) dst->ne[1], big ? bt_tn : 32u);
     const uint32_t batches  = (uint32_t) (dst->ne[2] * dst->ne[3]);
     ggml_d3d12_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va }, tiles_m * tiles_n * batches);
