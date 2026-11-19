@@ -909,7 +909,9 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 }
 #endif   // BT_DP4A
 #else
+#ifndef TILE_M
 #define TILE_M 64
+#endif
 #define TILE_N 32
 #define TILE_K 32
 
@@ -1140,6 +1142,141 @@ void load_a_row(uint row_base, uint k0, out float vals[TILE_K]) {
 #endif
 }
 
+// exp1165: A_STAGE4 + TILE_M ported from the DX11 kernel (ggml-d3d11 mul_mat_tiled.hlsl, v0.4.12)
+#if defined(SRC0_F32) || defined(SRC0_F16) || defined(SRC0_Q8_0) || defined(SRC0_Q4_0) || defined(SRC0_Q4_K) || defined(SRC0_Q6_K)
+// A_STAGE4: all 256 threads stage the A tile, 4 threads per src0 row, 8 values each (instead of 64 threads
+// doing a whole row alone while the other 192 wait at the barrier)
+#define A_STAGE4
+#define A_PER_ROW (NTHREADS / TILE_M)
+#if A_PER_ROW * TILE_M != NTHREADS || (A_PER_ROW != 1 && A_PER_ROW != 2 && A_PER_ROW != 4)
+#error A_STAGE4 needs NTHREADS / TILE_M to be 1, 2 or 4
+#endif
+
+// element index inside the 32-value block of value i (0..7) of part p (0..3)
+uint a_elem(uint p, uint i) {
+#if defined(SRC0_Q4_0)
+    return (i < 4) ? (p * 4 + i) : (16 + p * 4 + (i - 4));
+#else
+    return p * 8 + i;
+#endif
+}
+
+void load_a_part(uint row_base, uint k0, uint p, out float v[8]) {
+#if defined(K_TAIL) && (defined(SRC0_F32) || defined(SRC0_F16))
+    if (k0 + p * 8 + 8 > k) {
+        [unroll] for (uint i = 0; i < 8; i++) {
+            const uint kk = k0 + p * 8 + i;
+#if defined(SRC0_F32)
+            v[i] = (kk < k) ? LOAD_F32(src0, row_base + kk) : 0.0f;
+#else
+            uint bits = 0;
+            if (kk < k) {
+                LOAD_U16_UNALIGNED(src0, (row_base + kk) * 2, bits);
+            }
+            v[i] = f16tof32(bits);
+#endif
+        }
+        return;
+    }
+#endif
+#if defined(SRC0_F32)
+    const uint4 w0 = src0.Load4((row_base + k0 + p * 8) * 4);
+    const uint4 w1 = src0.Load4((row_base + k0 + p * 8 + 4) * 4);
+    v[0] = asfloat(w0.x); v[1] = asfloat(w0.y); v[2] = asfloat(w0.z); v[3] = asfloat(w0.w);
+    v[4] = asfloat(w1.x); v[5] = asfloat(w1.y); v[6] = asfloat(w1.z); v[7] = asfloat(w1.w);
+#elif defined(SRC0_F16)
+    [unroll] for (uint i = 0; i < 8; i += 2) {
+        uint w;
+        LOAD_U32_UNALIGNED(src0, (row_base + k0 + p * 8 + i) * 2, w);
+        v[i + 0] = f16tof32(w & 0xFFFFu);
+        v[i + 1] = f16tof32(w >> 16);
+    }
+#elif defined(SRC0_Q8_0)
+    const uint base = (row_base + k0 / 32) * 34;
+    uint dbits;
+    LOAD_U16_UNALIGNED(src0, base, dbits);
+    const float d = f16tof32(dbits);
+    [unroll] for (uint j = 0; j < 2; j++) {
+        uint q;
+        LOAD_U32_UNALIGNED(src0, base + 2 + 8 * p + 4 * j, q);
+        [unroll] for (uint b = 0; b < 4; b++) {
+            v[j * 4 + b] = (float) sbyte_of(q, b) * d;
+        }
+    }
+#elif defined(SRC0_Q4_K)
+    // same sub-block decode as load_a_row; part p covers elements p*8..p*8+7, i.e. 4-byte groups 2p and 2p+1
+    const uint blk  = k0 / 256;
+    const uint sb   = (k0 % 256) / 32;
+    const uint base = (row_base + blk) * 144;
+    uint w;
+    LOAD_U32_UNALIGNED(src0, base, w);
+    const float d    = f16tof32(w & 0xFFFFu);
+    const float dmin = f16tof32(w >> 16);
+    uint sc0, sc1, sc2;
+    LOAD_U32_UNALIGNED(src0, base + 4, sc0);
+    LOAD_U32_UNALIGNED(src0, base + 8, sc1);
+    LOAD_U32_UNALIGNED(src0, base + 12, sc2);
+    uint sc, mn;
+    if (sb < 4) {
+        sc = byte_of(sc0, sb) & 63u;
+        mn = byte_of(sc1, sb) & 63u;
+    } else {
+        sc = (byte_of(sc2, sb - 4) & 0xFu) | ((byte_of(sc0, sb - 4) >> 6) << 4);
+        mn = (byte_of(sc2, sb - 4) >> 4) | ((byte_of(sc1, sb - 4) >> 6) << 4);
+    }
+    const float dl    = d * (float) sc;
+    const float ml    = dmin * (float) mn;
+    const uint  shift = (sb & 1u) * 4u;
+    const uint  qbase = base + 16 + 32 * (sb / 2) + 8 * p;
+    [unroll] for (uint j = 0; j < 2; j++) {
+        uint q;
+        LOAD_U32_UNALIGNED(src0, qbase + 4 * j, q);
+        [unroll] for (uint b = 0; b < 4; b++) {
+            v[j * 4 + b] = dl * (float) ((byte_of(q, b) >> shift) & 0xFu) - ml;
+        }
+    }
+#elif defined(SRC0_Q6_K)
+    const uint blk  = k0 / 256;
+    const uint sb   = (k0 % 256) / 32;
+    const uint h    = sb / 4;
+    const uint t    = sb % 4;
+    const uint base = (row_base + blk) * 210;
+    uint dbits;
+    LOAD_U16_UNALIGNED(src0, base + 208, dbits);
+    const float d = f16tof32(dbits);
+    const uint  ql_base = base + 64 * h + 32 * (t & 1u) + 8 * p;
+    const uint  qh_base = base + 128 + 32 * h + 8 * p;
+    const uint  sc_base = base + 192 + 8 * h + 2 * t;
+    const uint  lshift  = (t >> 1) * 4u;
+    const uint  hshift  = t * 2u;
+    uint scw;
+    LOAD_U32_UNALIGNED(src0, sc_base, scw);
+    const float dsc = d * (float) sbyte_of(scw, p < 2 ? 0 : 1);
+    [unroll] for (uint j = 0; j < 2; j++) {
+        uint ql, qh;
+        LOAD_U32_UNALIGNED(src0, ql_base + 4 * j, ql);
+        LOAD_U32_UNALIGNED(src0, qh_base + 4 * j, qh);
+        [unroll] for (uint b = 0; b < 4; b++) {
+            const int q = (int) (((byte_of(ql, b) >> lshift) & 0xFu) | (((byte_of(qh, b) >> hshift) & 3u) << 4)) - 32;
+            v[j * 4 + b] = dsc * (float) q;
+        }
+    }
+#else // SRC0_Q4_0
+    const uint base = (row_base + k0 / 32) * 18;
+    uint dbits;
+    LOAD_U16_UNALIGNED(src0, base, dbits);
+    const float d = f16tof32(dbits);
+    uint q;
+    LOAD_U32_UNALIGNED(src0, base + 2 + 4 * p, q);
+    [unroll] for (uint b = 0; b < 4; b++) {
+        const uint byte = byte_of(q, b);
+        v[b]     = ((float) (byte & 0xFu) - 8.0f) * d;
+        v[4 + b] = ((float) (byte >> 4) - 8.0f) * d;
+    }
+#endif
+}
+#endif
+
 [numthreads(NTHREADS, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint tid       = gtid.x;
@@ -1211,7 +1348,26 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     }
 
     for (uint kt = 0; kt < k_end; kt += TILE_K) {
-#if defined(IQ_SPLIT)
+#if defined(A_STAGE4)
+        {
+            const uint ar = tid / A_PER_ROW;
+            const uint r  = row0 + ar;
+            [unroll] for (uint ps = 0; ps < 4 / A_PER_ROW; ps++) {
+                const uint ap = tid % A_PER_ROW + ps * A_PER_ROW;
+                float v[8];
+                if (r < m) {
+                    load_a_part(a_batch + r * stride_01, kt, ap, v);
+                } else {
+                    [unroll] for (uint z = 0; z < 8; z++) {
+                        v[z] = 0.0f;
+                    }
+                }
+                [unroll] for (uint zi = 0; zi < 8; zi++) {
+                    Atile[a_elem(ap, zi)][ar] = v[zi];
+                }
+            }
+        }
+#elif defined(IQ_SPLIT)
         {
             const uint r = row0 + tid / 4;
             if (r < m) {
