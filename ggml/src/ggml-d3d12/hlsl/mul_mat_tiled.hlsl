@@ -1143,7 +1143,8 @@ void load_a_row(uint row_base, uint k0, out float vals[TILE_K]) {
 }
 
 // exp1165: A_STAGE4 + TILE_M ported from the DX11 kernel (ggml-d3d11 mul_mat_tiled.hlsl, v0.4.12)
-#if defined(SRC0_F32) || defined(SRC0_F16) || defined(SRC0_Q8_0) || defined(SRC0_Q4_0) || defined(SRC0_Q4_K) || defined(SRC0_Q6_K)
+// exp1170: not for F32 - its old one-thread-per-row staging is faster on DX12 (exp1169)
+#if defined(SRC0_F16) || defined(SRC0_Q8_0) || defined(SRC0_Q4_0) || defined(SRC0_Q4_K) || defined(SRC0_Q6_K)
 // A_STAGE4: all 256 threads stage the A tile, 4 threads per src0 row, 8 values each (instead of 64 threads
 // doing a whole row alone while the other 192 wait at the barrier)
 #define A_STAGE4
@@ -1184,6 +1185,13 @@ void load_a_part(uint row_base, uint k0, uint p, out float v[8]) {
     const uint4 w1 = src0.Load4((row_base + k0 + p * 8 + 4) * 4);
     v[0] = asfloat(w0.x); v[1] = asfloat(w0.y); v[2] = asfloat(w0.z); v[3] = asfloat(w0.w);
     v[4] = asfloat(w1.x); v[5] = asfloat(w1.y); v[6] = asfloat(w1.z); v[7] = asfloat(w1.w);
+#elif defined(SRC0_F16) && defined(F16_AL)
+    // exp1172: the host set F16_AL only when every row starts 4-byte aligned -> one 16-byte load for the 8 values
+    const uint4 w = src0.Load4((row_base + k0 + p * 8) * 2);
+    v[0] = f16tof32(w.x & 0xFFFFu); v[1] = f16tof32(w.x >> 16);
+    v[2] = f16tof32(w.y & 0xFFFFu); v[3] = f16tof32(w.y >> 16);
+    v[4] = f16tof32(w.z & 0xFFFFu); v[5] = f16tof32(w.z >> 16);
+    v[6] = f16tof32(w.w & 0xFFFFu); v[7] = f16tof32(w.w >> 16);
 #elif defined(SRC0_F16)
     [unroll] for (uint i = 0; i < 8; i += 2) {
         uint w;

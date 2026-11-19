@@ -1720,11 +1720,18 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     }
     // exp1165: classic kernel with 128 rows per workgroup for the A_STAGE4 types except Q6_K, as in the DX11 kernel (exp1164:
     // SmolVLA F16 weights 928 -> DX11 452 us per dispatch on Iris Xe). GGML_D3D12_TILE_M=64 restores the old tile.
+    // exp1170: F32 stays on the old 64-row path without A_STAGE4 (exp1169, Iris Xe: 1314 us vs 1402 at 64 + A_STAGE4, 1632 at 128).
     static const int tm_env = [] { const char * e = getenv("GGML_D3D12_TILE_M"); return e ? atoi(e) : 128; }();
-    const uint32_t tile_m = !big && tm_env == 128 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_Q8_0 ||
+    const uint32_t tile_m = !big && tm_env == 128 && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_Q8_0 ||
                                                       src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_K) ? 128u : 64u;
     if (tile_m != 64) {
         defines.push_back("TILE_M=" + std::to_string(tile_m));
+    }
+    // exp1172: F16 weights whose rows all start 4-byte aligned are staged with one Load4 per 8 values instead of 8 unaligned
+    // dword loads (offset and every stride an even number of halves)
+    if (!big && src0->type == GGML_TYPE_F16 && tile_m == 128 && getenv("GGML_D3D12_NO_F16_AL") == nullptr &&
+        ggml_d3d12_bind_tensor(src0).elem_offset % 2 == 0 && src0->nb[1] % 4 == 0 && src0->nb[2] % 4 == 0 && src0->nb[3] % 4 == 0) {
+        defines.push_back("F16_AL");
     }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines,
                                                         use_dp4a ? D3D_SHADER_MODEL_6_4 : D3D_SHADER_MODEL_6_0);
