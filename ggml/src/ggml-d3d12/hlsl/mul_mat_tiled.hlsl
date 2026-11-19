@@ -790,6 +790,25 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                     vals[j * 4 + b] = dl * BT_KV_IQ4NL[high ? (byte >> 4) : (byte & 0xFu)];
                 }
             }
+#elif defined(SRC0_F16)
+            // exp1177: F16 weights in the big tile (host: k % 32 == 0, no DP4a); F16_AL = every row starts 4-byte aligned
+            const uint hb = (a_batch + a_r * stride_01 + kt + a_part * A_ELEMS) * 2;
+#if defined(F16_AL) && (A_ELEMS % 8 == 0)
+            [unroll] for (uint j = 0; j < A_ELEMS / 8; j++) {
+                const uint4 w = src0.Load4(hb + 16 * j);
+                vals[j * 8 + 0] = f16tof32(w.x & 0xFFFFu); vals[j * 8 + 1] = f16tof32(w.x >> 16);
+                vals[j * 8 + 2] = f16tof32(w.y & 0xFFFFu); vals[j * 8 + 3] = f16tof32(w.y >> 16);
+                vals[j * 8 + 4] = f16tof32(w.z & 0xFFFFu); vals[j * 8 + 5] = f16tof32(w.z >> 16);
+                vals[j * 8 + 6] = f16tof32(w.w & 0xFFFFu); vals[j * 8 + 7] = f16tof32(w.w >> 16);
+            }
+#else
+            [unroll] for (uint j = 0; j < A_ELEMS / 2; j++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, hb + 4 * j, q);
+                vals[2 * j]     = f16tof32(q & 0xFFFFu);
+                vals[2 * j + 1] = f16tof32(q >> 16);
+            }
+#endif
 #else
             // Q8_0 block: f16 d, 32 int8
             const uint base = (a_batch + a_r * stride_01 + kt / 32) * 34;
