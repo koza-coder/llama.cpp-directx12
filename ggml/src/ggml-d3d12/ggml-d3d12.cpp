@@ -1727,6 +1727,12 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     if (tile_m != 64) {
         defines.push_back("TILE_M=" + std::to_string(tile_m));
     }
+    // exp1172: F16 weights whose rows all start 4-byte aligned are staged with one Load4 per 8 values instead of 8 unaligned
+    // dword loads (offset and every stride an even number of halves)
+    if (!big && src0->type == GGML_TYPE_F16 && tile_m == 128 && getenv("GGML_D3D12_NO_F16_AL") == nullptr &&
+        ggml_d3d12_bind_tensor(src0).elem_offset % 2 == 0 && src0->nb[1] % 4 == 0 && src0->nb[2] % 4 == 0 && src0->nb[3] % 4 == 0) {
+        defines.push_back("F16_AL");
+    }
     d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines,
                                                         use_dp4a ? D3D_SHADER_MODEL_6_4 : D3D_SHADER_MODEL_6_0);
 
