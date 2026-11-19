@@ -1143,7 +1143,8 @@ void load_a_row(uint row_base, uint k0, out float vals[TILE_K]) {
 }
 
 // exp1165: A_STAGE4 + TILE_M ported from the DX11 kernel (ggml-d3d11 mul_mat_tiled.hlsl, v0.4.12)
-#if defined(SRC0_F32) || defined(SRC0_F16) || defined(SRC0_Q8_0) || defined(SRC0_Q4_0) || defined(SRC0_Q4_K) || defined(SRC0_Q6_K)
+// exp1170: not for F32 - its old one-thread-per-row staging is faster on DX12 (exp1169)
+#if defined(SRC0_F16) || defined(SRC0_Q8_0) || defined(SRC0_Q4_0) || defined(SRC0_Q4_K) || defined(SRC0_Q6_K)
 // A_STAGE4: all 256 threads stage the A tile, 4 threads per src0 row, 8 values each (instead of 64 threads
 // doing a whole row alone while the other 192 wait at the barrier)
 #define A_STAGE4
