@@ -1675,8 +1675,11 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     // exp1103: Q5_K in the DP4a big tile (GGML_D3D12_BT_Q5K=0 turns it off)
     static const char * q5k_env = getenv("GGML_D3D12_BT_Q5K");
     const bool q5k_dp4a = dp4a_ok && bt_wide && (q5k_env ? atoi(q5k_env) != 0 : true);
+    // exp1177: F16 weights in the fp32 big tile when k is a multiple of 32 (no K_TAIL there); GGML_D3D12_BT_F16=0 turns it off
+    static const char * btf16_env = getenv("GGML_D3D12_BT_F16");
+    const bool f16_big = (btf16_env ? atoi(btf16_env) != 0 : true) && src0->type == GGML_TYPE_F16 && src0->ne[0] % 32 == 0;
     const bool big = bt_on && (uint32_t) dst->ne[1] >= bt_min &&
-                     (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 || (q5k_dp4a && src0->type == GGML_TYPE_Q5_K) ||
+                     (f16_big || src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 || (q5k_dp4a && src0->type == GGML_TYPE_Q5_K) ||
                       ((dp4a_ok && bt_wide) || kq_fp32) && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) ||
                       iq_fp32 && (src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ4_XS) ||
                       iq2_fp32 && (src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ2_S ||
@@ -1706,7 +1709,8 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
         defines.push_back("BT_HALF=" + std::to_string(GGML_D3D12_BT_HALF));
 #endif
 #ifdef GGML_D3D12_BT_DP4A
-        use_dp4a = dev.vendor_id != 0x1ED5 && dev.caps.shader_model >= D3D_SHADER_MODEL_6_4;   // exp621: not on Moore Threads (dot4add 0.23x fp32)
+        use_dp4a = dev.vendor_id != 0x1ED5 && dev.caps.shader_model >= D3D_SHADER_MODEL_6_4 &&
+                   src0->type != GGML_TYPE_F16;   // exp621: not on Moore Threads (dot4add 0.23x fp32)
         if (use_dp4a) {
             defines.push_back("BT_DP4A=1");   // integer-dot kernel, needs SM 6.4
 #ifdef GGML_D3D12_BT_AL
@@ -1729,7 +1733,7 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     }
     // exp1172: F16 weights whose rows all start 4-byte aligned are staged with one Load4 per 8 values instead of 8 unaligned
     // dword loads (offset and every stride an even number of halves)
-    if (!big && src0->type == GGML_TYPE_F16 && tile_m == 128 && getenv("GGML_D3D12_NO_F16_AL") == nullptr &&
+    if (src0->type == GGML_TYPE_F16 && (big || tile_m == 128) && getenv("GGML_D3D12_NO_F16_AL") == nullptr &&
         ggml_d3d12_bind_tensor(src0).elem_offset % 2 == 0 && src0->nb[1] % 4 == 0 && src0->nb[2] % 4 == 0 && src0->nb[3] % 4 == 0) {
         defines.push_back("F16_AL");
     }
