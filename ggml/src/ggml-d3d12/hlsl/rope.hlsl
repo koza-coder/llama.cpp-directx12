@@ -1,6 +1,6 @@
 #include "common.hlsli"
 
-// defines: TYPE_F32 or TYPE_F16 (+USE_16BIT), FF_FUNC when frequency factors are present,
+// defines: TYPE_F32, TYPE_F16 or TYPE_BF16 (16-bit types with USE_16BIT), FF_FUNC when frequency factors are present,
 // BACKWARD for ROPE_BACK, which is this same rotation with the sine negated
 
 #ifdef BACKWARD
@@ -12,6 +12,17 @@
 #if defined(TYPE_F16)
 #define LOAD(buf, i)     LOAD_F16(buf, i)
 #define STORE(buf, i, v) STORE_F16(buf, i, v)
+#elif defined(TYPE_BF16)
+// bf16 (needs USE_16BIT): f32 -> bf16 rounds to nearest even, a NaN stays a NaN (as cpy.hlsl / set_rows.hlsl)
+uint rope_f32_to_bf16_bits(float f) {
+    const uint x = asuint(f);
+    if ((x & 0x7FFFFFFFu) > 0x7F800000u) {
+        return (x >> 16) | 0x40u;
+    }
+    return (x + 0x7FFFu + ((x >> 16) & 1u)) >> 16;
+}
+#define LOAD(buf, i)     asfloat(((uint) (buf).Load<uint16_t>((i) * 2)) << 16)
+#define STORE(buf, i, v) (buf).Store<uint16_t>((i) * 2, (uint16_t) rope_f32_to_bf16_bits(v))
 #else
 #define LOAD(buf, i)     LOAD_F32(buf, i)
 #define STORE(buf, i, v) STORE_F32(buf, i, v)
