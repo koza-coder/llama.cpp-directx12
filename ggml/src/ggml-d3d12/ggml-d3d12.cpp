@@ -3927,7 +3927,12 @@ static void ggml_d3d12_gated_delta_net(d3d12_device_ctx & dev, ggml_tensor * dst
 static void ggml_d3d12_rope(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * src2,
                             ggml_tensor * dst, bool backward = false) {
     std::vector<std::string> defines;
-    ggml_d3d12_float_type_define(dst->type, defines);
+    if (dst->type == GGML_TYPE_BF16) {
+        defines.push_back("TYPE_BF16");
+        defines.push_back("USE_16BIT");
+    } else {
+        ggml_d3d12_float_type_define(dst->type, defines);
+    }
     if (src2) {
         defines.push_back("FF_FUNC");
     }
@@ -5528,7 +5533,7 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
         // ROPE_BACK is the same rotation with the sine negated, and DeepSeek-V4-Flash uses it in its
         // forward graph, so it is not a training-only op
         case GGML_OP_ROPE_BACK:
-            return (op->type == GGML_TYPE_F32 || (op->type == GGML_TYPE_F16 && ctx->caps.native_16bit)) &&
+            return (op->type == GGML_TYPE_F32 || ((op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) && ctx->caps.native_16bit)) &&
                    src0->type == op->type && src1->type == GGML_TYPE_I32 && src0->ne[0] % 2 == 0 &&
                    (!op->src[2] || op->src[2]->type == GGML_TYPE_F32);
         case GGML_OP_GLU:
