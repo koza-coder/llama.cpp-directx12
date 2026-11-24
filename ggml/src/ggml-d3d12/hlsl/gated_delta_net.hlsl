@@ -66,6 +66,104 @@ cbuffer Params : register(b0) {
     uint nwg_x;
 };
 
+#if defined(LANES)
+// LANES threads share one state row (S_V % (4 * LANES) == 0): lane l holds the float4 columns l, l + LANES, ...
+// The two dot products per token are summed through groupshared memory; red_k and red_q alternate, so two
+// barriers per token suffice (a buffer is rewritten only after the other one's barrier). Threads past n_rows
+// keep running (no early return before a barrier) and skip their loads and stores.
+#define NV (S_V / (4 * LANES))
+groupshared float red_k[WG_SIZE];
+groupshared float red_q[WG_SIZE];
+
+[numthreads(WG_SIZE, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
+    const uint gt   = flat_index(id, nwg_x);
+    const uint lane = lid.x % LANES;
+    const uint c0   = lid.x - lane;   // first slot of this row's lanes
+    const uint r    = gt / LANES;
+    const bool live = r < n_rows;
+    const uint rr   = live ? r : 0;
+    const uint iv3 = rr / (n_head * S_V);
+    const uint iv1 = (rr / S_V) % n_head;
+    const uint j   = rr % S_V;
+    const uint iq1 = iv1 % neq1;
+    const uint ik1 = iv1 % nek1;
+    const uint iq3 = iv3 / rq3;
+    const uint ik3 = iv3 / rk3;
+
+    const uint state_row = (iv3 * n_head + iv1) * S_V * S_V + j * S_V;
+
+    float4 row[NV];
+    for (uint a = 0; a < NV; a++) {
+        const uint c = 4 * (lane + LANES * a);
+        row[a] = 0.0f;
+        if (live) {
+            row[a] = t0 == 0 ? asfloat(s_buf.Load4((offset_s + iv3 * state_seq_stride + iv1 * S_V * S_V + j * S_V + c) * 4))
+                             : asfloat(st.Load4((offset_st + state_row + c) * 4));
+        }
+    }
+
+    for (uint t = t0; t < t1; t++) {
+        const uint q_base = offset_q + iq3 * stride_q3 + t * stride_q2 + iq1 * stride_q1;
+        const uint k_base = offset_k + ik3 * stride_k3 + t * stride_k2 + ik1 * stride_k1;
+        const uint g_base = offset_g + iv3 * stride_g3 + t * stride_g2 + iv1 * stride_g1;
+        const float v    = LOAD_F32(v_buf, offset_v + iv3 * stride_v3 + t * stride_v2 + iv1 * stride_v1 + j);
+        const float beta = LOAD_F32(b_buf, offset_b + iv3 * stride_b3 + t * stride_b2 + iv1 * stride_b1);
+#if !defined(KDA)
+        const float decay = exp(LOAD_F32(g_buf, g_base));
+#endif
+        float4 kk[NV];
+        float sum = 0.0f;
+        for (uint a3 = 0; a3 < NV; a3++) {
+            const uint c = 4 * (lane + LANES * a3);
+#if defined(KDA)
+            row[a3] *= exp(asfloat(g_buf.Load4((g_base + c) * 4)));
+#else
+            row[a3] *= decay;
+#endif
+            kk[a3] = asfloat(k_buf.Load4((k_base + c) * 4));
+            sum += dot(row[a3], kk[a3]);
+        }
+        red_k[lid.x] = sum;
+        GroupMemoryBarrierWithGroupSync();
+        float tot = 0.0f;
+        for (uint l = 0; l < LANES; l++) {
+            tot += red_k[c0 + l];
+        }
+        const float delta = (v - tot) * beta;
+        float out_v = 0.0f;
+        for (uint a5 = 0; a5 < NV; a5++) {
+            row[a5] += delta * kk[a5];
+            out_v += dot(row[a5], asfloat(q_buf.Load4((q_base + 4 * (lane + LANES * a5)) * 4)));
+        }
+        red_q[lid.x] = out_v;
+        GroupMemoryBarrierWithGroupSync();
+        if (live && lane == 0) {
+            float oq = 0.0f;
+            for (uint l2 = 0; l2 < LANES; l2++) {
+                oq += red_q[c0 + l2];
+            }
+            STORE_F32(dst, offset_dst + (iv3 * n_tokens * n_head + t * n_head + iv1) * S_V + j, oq * scale);
+        }
+
+        if (live && n_snap > 1) {
+            const int slot = (int) n_tokens - 1 - (int) t;
+            if (slot >= 0 && slot < (int) n_snap) {
+                const uint o = offset_st + (uint) slot * st_slot_stride + state_row;
+                for (uint a6 = 0; a6 < NV; a6++) {
+                    st.Store4((o + 4 * (lane + LANES * a6)) * 4, asuint(row[a6]));
+                }
+            }
+        }
+    }
+
+    if (live && n_snap == 1) {
+        for (uint a7 = 0; a7 < NV; a7++) {
+            st.Store4((offset_st + state_row + 4 * (lane + LANES * a7)) * 4, asuint(row[a7]));
+        }
+    }
+}
+#else
 [numthreads(WG_SIZE, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     const uint r = flat_index(id, nwg_x);
@@ -142,3 +240,4 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 }
+#endif
