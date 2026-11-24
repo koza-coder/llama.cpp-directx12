@@ -3709,8 +3709,12 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
     // exp509/exp510: on the Moore Threads S80 the prompt kernel (pass 1) took 26 ms per call (the registers of q and acc
     // spill at head size 256/512); the workgroup-per-(row, block) kernel takes 1.5 ms. GGML_D3D12_FA_PROMPT_DECODE=0/1
     // overrides the default (1 on every vendor since v0.3.5; exp559/exp563: RX and Intel gain too).
+    // exp1223/exp1225/exp1228 (AMD R9700): the one-row kernel stays faster on prompts when GQ query heads share a workgroup or the head is large
+    // (DK 256/512: prompt kernel -18 to -74 %; LFM2.5 DK 64 with GQ=4: -13 % pp4096). With DK <= 64 and an odd query/KV head ratio (GQ stays 1,
+    // qwen2.5-0.5b: 14 query heads on 2 KV heads) the prompt kernel is +43 % pp512 / +24 % pp4096, so AMD uses it there.
     static const char * fa_env = getenv("GGML_D3D12_FA_PROMPT_DECODE");
-    const bool     prompt_decode = fa_env ? atoi(fa_env) != 0 : true;
+    const bool     amd_prompt = dev.vendor_id == 0x1002 && k->ne[0] <= 64 && k->ne[2] > 0 && (q->ne[2] / k->ne[2]) % 2 != 0;
+    const bool     prompt_decode = fa_env ? atoi(fa_env) != 0 : !amd_prompt;
     const bool     decode = (q->ne[1] == 1 || prompt_decode) && !dev.no_fuse;
     // exp539: GQ query heads that share one KV head (and one mask row) go into one workgroup; prompt rows on every vendor (GGML_D3D12_FA_GQ=1 turns it off)
     uint32_t gq = 1;
