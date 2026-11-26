@@ -234,6 +234,14 @@ static void launch_gated_delta_net(
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         }
+        case 256: {
+            // MemT memory state
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<256, KDA, keep_rs_t>, launch_params,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            break;
+        }
         default:
             GGML_ABORT("fatal error");
     }

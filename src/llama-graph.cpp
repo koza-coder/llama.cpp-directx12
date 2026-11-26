@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-memt.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -390,6 +391,20 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
             data[n_outputs++] = i;
         }
     }
+}
+
+void llm_graph_input_memt::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(seq_ids);
+    GGML_ASSERT(ggml_backend_buffer_is_host(seq_ids->buffer));
+
+    int32_t * data = (int32_t *) seq_ids->data;
+    for (uint32_t s = 0; s < ubatch->n_seqs; ++s) {
+        data[s] = ubatch->seq_id[s*ubatch->n_seq_tokens][0];
+    }
+}
+
+bool llm_graph_input_memt::can_reuse(const llm_graph_params & params) {
+    return params.memt == memt && seq_ids->ne[0] == params.ubatch.n_seqs;
 }
 
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
@@ -1717,6 +1732,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    memt             (params.memt),
     hdmd             (model.hdmd.rot.empty() ? nullptr : &model.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
     layer_inp_src    (params.layer_inp_src),
@@ -2972,6 +2988,118 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     res->add_input(std::move(inp));
 
     return cur;
+}
+
+llm_graph_input_memt * llm_graph_context::build_inp_memt() const {
+    if (!memt || !memt->enabled() || !(cparams.memt_read || cparams.memt_commit)) {
+        return nullptr;
+    }
+
+    GGML_ASSERT(ubatch.equal_seqs() && "MemT memory requires equal-sequence ubatches");
+
+    auto inp = std::make_unique<llm_graph_input_memt>(memt);
+
+    inp->seq_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_seqs);
+    ggml_set_input(inp->seq_ids);
+    ggml_set_name(inp->seq_ids, "memt_seq_ids");
+
+    return static_cast<llm_graph_input_memt *>(res->add_input(std::move(inp)));
+}
+
+ggml_tensor * llm_graph_context::build_memt(
+        llm_graph_input_memt * inp,
+        const llama_layer_memt & layer,
+                 ggml_tensor * cur,
+                         int   il) const {
+    const int64_t S = hparams.n_embd_head_k();
+    const int64_t H = n_head;
+
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    const int64_t n_seqs       = ubatch.n_seqs;
+
+    // l2 norm as x * rsqrt(sum(x^2) + 1e-6), the same as the reference
+    auto l2_norm = [&](ggml_tensor * x) {
+        x = ggml_rms_norm(ctx0, x, 1e-6f/S);
+        return ggml_scale(ctx0, x, 1.0f/sqrtf((float) S));
+    };
+
+    auto get_state = [&](ggml_tensor * all) {
+        ggml_tensor * st = ggml_get_rows(ctx0, all, inp->seq_ids);
+        return ggml_reshape_4d(ctx0, st, S, S, H, n_seqs);
+    };
+
+    // read: o = rms_norm(q^T S) * act(g)
+    ggml_tensor * q = build_lora_mm(layer.wq, cur);
+    q = ggml_reshape_4d(ctx0, q, S, H, n_seq_tokens, n_seqs);
+    q = l2_norm(q);
+    q = ggml_scale(ctx0, q, 1.0f/sqrtf((float) S)); // read scale
+    cb(q, "memt_q", il);
+
+    ggml_tensor * s_read = get_state(memt->read_for(il));
+
+    // [S_k, S_v, H, n_seqs] x [S_k, n_seq_tokens, H, n_seqs] -> [S_v, n_seq_tokens, H, n_seqs]
+    ggml_tensor * read = ggml_mul_mat(ctx0, s_read, ggml_permute(ctx0, q, 0, 2, 1, 3));
+    read = ggml_cont(ctx0, ggml_permute(ctx0, read, 0, 2, 1, 3));
+    read = ggml_reshape_3d(ctx0, read, S, H, n_tokens);
+    cb(read, "memt_read", il);
+
+    ggml_tensor * gate = build_lora_mm(layer.g_down, build_lora_mm(layer.wg, cur));
+    gate = ggml_reshape_3d(ctx0, gate, S, H, n_tokens);
+    gate = ggml_silu(ctx0, gate);
+    if (hparams.memt_gate_softcap > 0.0f) {
+        gate = ggml_scale(ctx0, gate, 1.0f/hparams.memt_gate_softcap);
+        gate = ggml_tanh(ctx0, gate);
+        gate = ggml_scale(ctx0, gate, hparams.memt_gate_softcap);
+    }
+
+    ggml_tensor * out = build_norm(read, layer.o_norm, nullptr, LLM_NORM_RMS, il);
+    out = ggml_mul(ctx0, out, gate);
+    out = ggml_reshape_2d(ctx0, out, S*H, n_tokens);
+    cb(out, "memt_out", il);
+
+    if (!cparams.memt_commit) {
+        return out;
+    }
+
+    // write: token level delta rule with a per key row decay
+    //   S = S * exp(g); S += u (w*v - u^T S)
+    ggml_tensor * k = build_lora_mm(layer.wk, cur);
+    k = ggml_reshape_4d(ctx0, k, S, H, n_seq_tokens, n_seqs);
+    k = l2_norm(k);
+
+    ggml_tensor * b = build_lora_mm(layer.wb, cur);
+    b = ggml_reshape_4d(ctx0, b, S, H, n_seq_tokens, n_seqs);
+    b = ggml_sqrt(ctx0, ggml_sigmoid(ctx0, b));
+
+    ggml_tensor * u = ggml_mul(ctx0, k, b);
+    cb(u, "memt_u", il);
+
+    ggml_tensor * v = build_lora_mm(layer.wv, cur);
+    ggml_tensor * w = ggml_sigmoid(ctx0, build_lora_mm(layer.ww, cur));
+    v = ggml_mul(ctx0, v, w);
+    v = ggml_reshape_4d(ctx0, v, S, H, n_seq_tokens, n_seqs);
+
+    ggml_tensor * g = build_lora_mm(layer.f_down, build_lora_mm(layer.wf, cur));
+    g = ggml_add(ctx0, g, layer.decay_bias);
+    g = ggml_softplus(ctx0, g);
+    g = ggml_reshape_4d(ctx0, g, S, H, n_seq_tokens, n_seqs);
+    g = ggml_mul(ctx0, g, ggml_reshape_4d(ctx0, layer.decay_scale, 1, H, 1, 1));
+    cb(g, "memt_g", il);
+
+    ggml_tensor * beta = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, H, n_seq_tokens, n_seqs), 1.0f);
+
+    ggml_tensor * s_write = get_state(memt->write_for(il));
+
+    ggml_tensor * res_gdn = ggml_gated_delta_net(ctx0, u, u, v, g, beta, s_write, 1);
+
+    ggml_tensor * s_new = ggml_view_2d(ctx0, res_gdn, S*S*H, n_seqs,
+            S*S*H*ggml_element_size(res_gdn),
+            S*H*n_seq_tokens*n_seqs*ggml_element_size(res_gdn));
+    cb(s_new, "memt_state", il);
+
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, memt->write_for(il), s_new, inp->seq_ids));
+
+    return out;
 }
 
 ggml_tensor * llm_graph_context::build_inp_mean() const {

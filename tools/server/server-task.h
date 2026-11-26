@@ -125,6 +125,13 @@ struct task_params {
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
 
+    // MemT native memory
+    std::string              memory_id;
+    bool                     memory_commit = false;
+    std::vector<std::string> memory_documents;   // imported into the memory before generation
+    std::vector<std::string> memory_turns;       // earlier turns, committed with the current turn
+    std::string              memory_turn_prompt; // prompt of the current turn, empty = whole prompt
+
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 

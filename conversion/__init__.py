@@ -211,6 +211,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "MapleForCausalLM": "maple",
     "MellumForCausalLM": "mellum",
     "Metis16ForCausalLM": "metis",
+    "MemTQwen3_5MoeForCausalLM": "qwen",
     "MiMoV2FlashForCausalLM": "mimo",
     "MiMoV2ForCausalLM": "mimo",
     "MiniCPM3ForCausalLM": "minicpm",

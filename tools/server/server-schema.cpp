@@ -77,6 +77,33 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(-1, std::numeric_limits<int64_t>::max())
         ->set_desc("Set a time limit in milliseconds for the prediction phase. The timeout triggers if generation exceeds this time (measured since the first token) and a newline has been generated. Useful for FIM applications"));
 
+    add((new field_str("memory_id"))
+        ->set_desc("MemT native memory: id of the memory state to read (and to update with memory_commit / memory_documents)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.memory_id = data.at("memory_id").get<std::string>();
+        }));
+
+    add((new field_bool("memory_commit", params.memory_commit))
+        ->set_desc("MemT native memory: when the generation ends normally, write the turns of this request into the memory"));
+
+    add((new field_json("memory_documents"))
+        ->set_desc("MemT native memory: list of documents to write into the memory before the generation")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.memory_documents = json_value(data, "memory_documents", std::vector<std::string>());
+        }));
+
+    add((new field_json("memory_turns"))
+        ->set_desc("MemT native memory: earlier turns (raw text) to write into the memory together with the current turn")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.memory_turns = json_value(data, "memory_turns", std::vector<std::string>());
+        }));
+
+    add((new field_str("memory_turn_prompt"))
+        ->set_desc("MemT native memory: prompt of the current turn (raw text) to write into the memory, default is the whole prompt")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.memory_turn_prompt = data.at("memory_turn_prompt").get<std::string>();
+        }));
+
     add((new field_json("response_fields"))
         ->set_desc("A list of response fields to return. Missing fields are omitted without error. Fields with a slash are unnested (e.g. generation_settings/n_predict moves n_predict to the root)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

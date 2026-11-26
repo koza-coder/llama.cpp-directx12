@@ -313,6 +313,9 @@ llama_context::llama_context(
         cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
     }
 
+    cparams.memt_read   = false;
+    cparams.memt_commit = false;
+
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
@@ -540,6 +543,11 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        memt = std::make_unique<llama_memt>();
+        if (!memt->init(model, cparams.n_seq_max)) {
+            throw std::runtime_error("failed to initialize MemT memory state");
+        }
     }
 
     // init backends
@@ -1601,6 +1609,38 @@ bool llama_context::h_nextn_dev_alloc() {
             ggml_backend_buffer_name(buf_h_nextn_dev.get()), ggml_backend_buffer_get_size(buf_h_nextn_dev.get())/1024.0/1024.0);
 
     return true;
+}
+
+size_t llama_context::memt_n_state() const {
+    return memt ? memt->n_state() : 0;
+}
+
+void llama_context::memt_set_state(llama_seq_id seq_id, const float * data) {
+    GGML_ASSERT(memt && memt->enabled());
+
+    memt->set(seq_id, data);
+
+    const bool read = memt->active();
+    if (cparams.memt_read != read) {
+        cparams.memt_read  = read;
+        sched_need_reserve = true;
+    }
+}
+
+void llama_context::memt_get_state(llama_seq_id seq_id, float * data) {
+    GGML_ASSERT(memt && memt->enabled());
+
+    synchronize();
+    memt->get(seq_id, data);
+}
+
+void llama_context::memt_set_commit(bool value) {
+    GGML_ASSERT(memt && memt->enabled());
+
+    if (cparams.memt_commit != value) {
+        cparams.memt_commit = value;
+        sched_need_reserve  = true;
+    }
 }
 
 bool llama_context::set_embeddings_nextn_dev(bool value) {
@@ -3063,6 +3103,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.memt          =*/ memt.get(),
         /*.layer_inp_dev =*/ layer_inp_dev,
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
@@ -4843,6 +4884,26 @@ int32_t llama_set_adapter_cvec(
     bool res = ctx->set_adapter_cvec(data, len, n_embd, il_start, il_end);
 
     return res ? 0 : -1;
+}
+
+//
+// MemT native memory
+//
+
+size_t llama_memt_n_state(const llama_context * ctx) {
+    return ctx->memt_n_state();
+}
+
+void llama_memt_set_state(llama_context * ctx, llama_seq_id seq_id, const float * data) {
+    ctx->memt_set_state(seq_id, data);
+}
+
+void llama_memt_get_state(llama_context * ctx, llama_seq_id seq_id, float * data) {
+    ctx->memt_get_state(seq_id, data);
+}
+
+void llama_memt_set_commit(llama_context * ctx, bool value) {
+    ctx->memt_set_commit(value);
 }
 
 //

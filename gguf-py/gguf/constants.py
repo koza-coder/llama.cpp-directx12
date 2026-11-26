@@ -155,6 +155,8 @@ class Keys:
         TOKEN_SHIFT_COUNT                 = "{arch}.token_shift_count"
         INTERLEAVE_MOE_LAYER_STEP         = "{arch}.interleave_moe_layer_step"
         FULL_ATTENTION_INTERVAL           = "{arch}.full_attention_interval"
+        MEMT_GATE_SOFTCAP                 = "{arch}.memt.gate_softcap"
+        MEMT_CHUNK_SIZE                   = "{arch}.memt.chunk_size"
         NUM_LOOPS                         = "{arch}.num_loops"
         SKIP_LOOP_FINAL_NORM              = "{arch}.skip_loop_final_norm"
         HASH_LAYER_COUNT                  = "{arch}.hash_layer_count"
@@ -967,6 +969,18 @@ class MODEL_TENSOR(IntEnum):
     SSM_C_NORM           = auto()
     SSM_D                = auto()
     SSM_NORM             = auto()
+    MEMT_Q               = auto()
+    MEMT_K               = auto()
+    MEMT_V               = auto()
+    MEMT_B               = auto()
+    MEMT_W               = auto()
+    MEMT_F               = auto()
+    MEMT_G               = auto()
+    MEMT_F_DOWN          = auto()
+    MEMT_G_DOWN          = auto()
+    MEMT_DECAY_BIAS      = auto()
+    MEMT_DECAY_SCALE     = auto()
+    MEMT_O_NORM          = auto()
     SSM_OUT              = auto()
     SSM_ALPHA            = auto() # qwen3.5
     SSM_BETA_ALPHA       = auto() # qwen3next
@@ -1981,6 +1995,18 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_C_NORM:                "blk.{bid}.ssm_c_norm",
     MODEL_TENSOR.SSM_D:                     "blk.{bid}.ssm_d",
     MODEL_TENSOR.SSM_NORM:                  "blk.{bid}.ssm_norm",
+    MODEL_TENSOR.MEMT_Q:                    "blk.{bid}.memt_q",
+    MODEL_TENSOR.MEMT_K:                    "blk.{bid}.memt_k",
+    MODEL_TENSOR.MEMT_V:                    "blk.{bid}.memt_v",
+    MODEL_TENSOR.MEMT_B:                    "blk.{bid}.memt_b",
+    MODEL_TENSOR.MEMT_W:                    "blk.{bid}.memt_w",
+    MODEL_TENSOR.MEMT_F:                    "blk.{bid}.memt_f",
+    MODEL_TENSOR.MEMT_G:                    "blk.{bid}.memt_g",
+    MODEL_TENSOR.MEMT_F_DOWN:               "blk.{bid}.memt_f_down",
+    MODEL_TENSOR.MEMT_G_DOWN:               "blk.{bid}.memt_g_down",
+    MODEL_TENSOR.MEMT_DECAY_BIAS:           "blk.{bid}.memt_decay_bias",
+    MODEL_TENSOR.MEMT_DECAY_SCALE:          "blk.{bid}.memt_decay_scale",
+    MODEL_TENSOR.MEMT_O_NORM:               "blk.{bid}.memt_o_norm",
     MODEL_TENSOR.SSM_OUT:                   "blk.{bid}.ssm_out",
     MODEL_TENSOR.SSM_ALPHA:                 "blk.{bid}.ssm_alpha",            # qwen3.5
     MODEL_TENSOR.SSM_BETA_ALPHA:            "blk.{bid}.ssm_ba",
@@ -3791,6 +3817,18 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_BETA,
         MODEL_TENSOR.SSM_ALPHA,
         MODEL_TENSOR.SSM_OUT,
+        MODEL_TENSOR.MEMT_Q,
+        MODEL_TENSOR.MEMT_K,
+        MODEL_TENSOR.MEMT_V,
+        MODEL_TENSOR.MEMT_B,
+        MODEL_TENSOR.MEMT_W,
+        MODEL_TENSOR.MEMT_F,
+        MODEL_TENSOR.MEMT_G,
+        MODEL_TENSOR.MEMT_F_DOWN,
+        MODEL_TENSOR.MEMT_G_DOWN,
+        MODEL_TENSOR.MEMT_DECAY_BIAS,
+        MODEL_TENSOR.MEMT_DECAY_SCALE,
+        MODEL_TENSOR.MEMT_O_NORM,
         # NextN/MTP tensors - preserved but unused
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
