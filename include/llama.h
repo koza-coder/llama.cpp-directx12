@@ -814,6 +814,28 @@ extern "C" {
                          int32_t   il_end);
 
     //
+    // MemT native memory
+    //
+    // a per-sequence memory state that the model reads in its attention layers
+    // a commit pass is a normal decode that also writes the tokens into the memory state
+
+    // number of tokens per memory chunk of the model, 0 if the model has no native memory
+    LLAMA_API uint32_t llama_model_memt_chunk_size(const struct llama_model * model);
+
+    // number of floats in the memory state of one sequence, 0 if the model has no native memory
+    LLAMA_API size_t llama_memt_n_state(const struct llama_context * ctx);
+
+    // set the memory state of a sequence (both the read snapshot and the write state)
+    // data == NULL clears it
+    LLAMA_API void llama_memt_set_state(struct llama_context * ctx, llama_seq_id seq_id, const float * data);
+
+    // get the write state of a sequence (the result of the commit passes since the last set)
+    LLAMA_API void llama_memt_get_state(struct llama_context * ctx, llama_seq_id seq_id, float * data);
+
+    // when enabled, llama_decode also updates the write state of the decoded sequences
+    LLAMA_API void llama_memt_set_commit(struct llama_context * ctx, bool value);
+
+    //
     // Memory
     //
 

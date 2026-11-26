@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-memt.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -149,6 +150,11 @@ struct llama_context {
                 int32_t   n_embd,
                 int32_t   il_start,
                 int32_t   il_end);
+
+    size_t memt_n_state() const;
+    void   memt_set_state(llama_seq_id seq_id, const float * data);
+    void   memt_get_state(llama_seq_id seq_id, float * data);
+    void   memt_set_commit(bool value);
 
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
@@ -345,6 +351,8 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    std::unique_ptr<llama_memt> memt;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

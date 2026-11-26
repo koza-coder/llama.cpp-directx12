@@ -740,6 +740,12 @@ class GGUFWriter:
     def add_full_attention_interval(self, interval: int) -> None:
         self.add_uint32(Keys.LLM.FULL_ATTENTION_INTERVAL.format(arch=self.arch), interval)
 
+    def add_memt_gate_softcap(self, value: float) -> None:
+        self.add_float32(Keys.LLM.MEMT_GATE_SOFTCAP.format(arch=self.arch), value)
+
+    def add_memt_chunk_size(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.MEMT_CHUNK_SIZE.format(arch=self.arch), value)
+
     def add_hash_layer_count(self, count: int) -> None:
         self.add_uint32(Keys.LLM.HASH_LAYER_COUNT.format(arch=self.arch), count)
 

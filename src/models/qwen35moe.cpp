@@ -15,6 +15,9 @@ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
+    ml.get_key(LLM_KV_MEMT_CHUNK_SIZE,    hparams.memt_chunk_size,   false);
+    ml.get_key(LLM_KV_MEMT_GATE_SOFTCAP,  hparams.memt_gate_softcap, false);
+
     // Mark recurrent layers (linear attention layers). MTP layers are dense
     // attention-only and must be flagged non-recurrent.
     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
@@ -77,6 +80,23 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
             // Q/K normalization for attention layers
             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
+
+            if (hparams.memt_chunk_size > 0) {
+                const int64_t memt_dim = n_embd_head_k * n_head;
+                auto & memt = layer.memt;
+                memt.wq          = create_tensor(tn(LLM_TENSOR_MEMT_Q,           "weight", il), { n_embd, memt_dim },        flags);
+                memt.wk          = create_tensor(tn(LLM_TENSOR_MEMT_K,           "weight", il), { n_embd, memt_dim },        flags);
+                memt.wv          = create_tensor(tn(LLM_TENSOR_MEMT_V,           "weight", il), { n_embd, memt_dim },        flags);
+                memt.wb          = create_tensor(tn(LLM_TENSOR_MEMT_B,           "weight", il), { n_embd, memt_dim },        flags);
+                memt.ww          = create_tensor(tn(LLM_TENSOR_MEMT_W,           "weight", il), { n_embd, memt_dim },        flags);
+                memt.wf          = create_tensor(tn(LLM_TENSOR_MEMT_F,           "weight", il), { n_embd, n_embd_head_k },   flags);
+                memt.wg          = create_tensor(tn(LLM_TENSOR_MEMT_G,           "weight", il), { n_embd, n_embd_head_k },   flags);
+                memt.f_down      = create_tensor(tn(LLM_TENSOR_MEMT_F_DOWN,      "weight", il), { n_embd_head_k, memt_dim }, flags);
+                memt.g_down      = create_tensor(tn(LLM_TENSOR_MEMT_G_DOWN,      "weight", il), { n_embd_head_k, memt_dim }, flags);
+                memt.decay_bias  = create_tensor(tn(LLM_TENSOR_MEMT_DECAY_BIAS,  "weight", il), { memt_dim },                flags);
+                memt.decay_scale = create_tensor(tn(LLM_TENSOR_MEMT_DECAY_SCALE, "weight", il), { n_head },                  flags);
+                memt.o_norm      = create_tensor(tn(LLM_TENSOR_MEMT_O_NORM,      "weight", il), { n_embd_head_k },           flags);
+            }
         } else {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
@@ -170,6 +190,8 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    inp_memt = build_inp_memt();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
@@ -278,6 +300,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
+    ggml_tensor * attn_inp = cur;
+
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
@@ -334,6 +358,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
 
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
     cb(cur, "attn_gated", il);
+
+    if (inp_memt && model.layers[il].memt.wq) {
+        cur = ggml_add(ctx0, cur, build_memt(inp_memt, model.layers[il].memt, attn_inp, il));
+        cb(cur, "attn_memt", il);
+    }
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
     cb(cur, "attn_output", il);

@@ -3149,6 +3149,8 @@ struct llama_model_qwen35moe : public llama_model_base {
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,
                             int   il);
+
+        llm_graph_input_memt * inp_memt = nullptr;
     };
 
     struct graph_mtp : public llm_graph_context {

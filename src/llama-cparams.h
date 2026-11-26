@@ -36,6 +36,8 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
+    bool memt_read;   // read the MemT memory state (at least one seq has memory)
+    bool memt_commit; // also write the MemT memory state
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;

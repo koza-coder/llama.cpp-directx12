@@ -3748,6 +3748,10 @@ int32_t llama_model_n_head(const llama_model * model) {
     return model->hparams.n_head();
 }
 
+uint32_t llama_model_memt_chunk_size(const llama_model * model) {
+    return model->hparams.memt_chunk_size;
+}
+
 int32_t llama_model_n_head_kv(const llama_model * model) {
     return model->hparams.n_head_kv();
 }

@@ -284,6 +284,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_FULL_ATTENTION_INTERVAL,           "%s.full_attention_interval"           },
     { LLM_KV_CLOVER_CORESET_ENABLED,            "%s.moe_block_coreset_enabled"         },
     { LLM_KV_CLOVER_CORESET_TOP_P,              "%s.moe_block_coreset_top_p"           },
+    { LLM_KV_MEMT_GATE_SOFTCAP,                 "%s.memt.gate_softcap"                 },
+    { LLM_KV_MEMT_CHUNK_SIZE,                   "%s.memt.chunk_size"                   },
     { LLM_KV_NUM_LOOPS,                         "%s.num_loops"                         },
     { LLM_KV_SKIP_LOOP_FINAL_NORM,              "%s.skip_loop_final_norm"              },
     { LLM_KV_HRM_LAYERS_PER_STACK,              "%s.hrm.layers_per_stack"              },
@@ -961,6 +963,18 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_ROUTER_OUT,                             "blk.%d.ffn_router_out" },
     { LLM_TENSOR_ATTN_V_GATE,                            "blk.%d.attn_v_gate" },
     { LLM_TENSOR_ATTN_V_EXPS,                            "blk.%d.attn_v_exps" },
+    { LLM_TENSOR_MEMT_Q,                                 "blk.%d.memt_q" },
+    { LLM_TENSOR_MEMT_K,                                 "blk.%d.memt_k" },
+    { LLM_TENSOR_MEMT_V,                                 "blk.%d.memt_v" },
+    { LLM_TENSOR_MEMT_B,                                 "blk.%d.memt_b" },
+    { LLM_TENSOR_MEMT_W,                                 "blk.%d.memt_w" },
+    { LLM_TENSOR_MEMT_F,                                 "blk.%d.memt_f" },
+    { LLM_TENSOR_MEMT_G,                                 "blk.%d.memt_g" },
+    { LLM_TENSOR_MEMT_F_DOWN,                            "blk.%d.memt_f_down" },
+    { LLM_TENSOR_MEMT_G_DOWN,                            "blk.%d.memt_g_down" },
+    { LLM_TENSOR_MEMT_DECAY_BIAS,                        "blk.%d.memt_decay_bias" },
+    { LLM_TENSOR_MEMT_DECAY_SCALE,                       "blk.%d.memt_decay_scale" },
+    { LLM_TENSOR_MEMT_O_NORM,                            "blk.%d.memt_o_norm" },
 };
 
 // declare information about the model weight tensors:
@@ -1397,6 +1411,18 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
 
     {LLM_TENSOR_ATTN_V_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_V_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+    {LLM_TENSOR_MEMT_Q,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MEMT_K,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MEMT_V,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MEMT_B,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MEMT_W,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MEMT_F,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MEMT_G,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MEMT_F_DOWN,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MEMT_G_DOWN,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MEMT_DECAY_BIAS,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_MEMT_DECAY_SCALE,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_MEMT_O_NORM,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
