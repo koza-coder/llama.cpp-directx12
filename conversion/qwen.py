@@ -863,6 +863,79 @@ class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
 
+def _is_memt_checkpoint(dir_model: Path) -> bool:
+    config_path = dir_model / "config.json"
+    if not config_path.is_file():
+        return False
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f).get("model_type") == "memt_qwen3_5_moe"
+
+
+@ModelBase.register_hparams_loader(_is_memt_checkpoint)
+def _load_memt_hparams(dir_model: Path) -> dict[str, Any]:
+    with open(dir_model / "config.json", "r", encoding="utf-8") as f:
+        hparams = json.load(f)
+    backbone = hparams["backbone_configs"]
+    hparams["text_config"] = backbone.get("text_config", backbone)
+    return hparams
+
+
+@ModelBase.register("MemTQwen3_5MoeForCausalLM")
+@ModelBase.example("MemTensor/MemT-1.0-Nano")
+class MemTQwen3_5MoeModel(Qwen3_5MoeTextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35MOE
+    # the config lists one MTP layer, but the checkpoint has no mtp.* tensors
+    no_mtp = True
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        memt = self.hparams["memt"]
+        expected = {
+            "gdn_version": "stable_gdn2",
+            "stable_gdn2_sqrt_erase_gate": True,
+            "memory_use_short_conv": False,
+            "memory_head_mode": "mha",
+            "memory_read_scale": "k_inv_sqrt",
+            "output_gate_type": "silu",
+            "output_gate_bias": False,
+        }
+        for key, value in expected.items():
+            if memt.get(key) != value:
+                raise ValueError(f"unsupported memt.{key}: {memt.get(key)!r}")
+        self.gguf_writer.add_memt_chunk_size(memt["chunk_tokens"])
+        self.gguf_writer.add_memt_gate_softcap(memt["output_gate_softcap_limit"] if memt["output_gate_softcap_enabled"] else 0.0)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if ".self_attn.memt." not in name:
+            yield from super().modify_tensors(data_torch, name, bid)
+            return
+
+        assert bid is not None
+        suffix = name.split(".self_attn.memt.", 1)[1]
+        if suffix == "in_proj.weight":
+            # rows: q, k, v, b, w (n_head * head_dim each), then f, g (head_dim each)
+            width = self.hparams["num_attention_heads"] * self.hparams["head_dim"]
+            dim = self.hparams["head_dim"]
+            parts = data_torch.split([width] * 5 + [dim, dim], dim=0)
+            for t, part in zip(["Q", "K", "V", "B", "W", "F", "G"], parts):
+                yield self.format_tensor_name(gguf.MODEL_TENSOR[f"MEMT_{t}"], bid), part
+            return
+
+        tensors = {
+            "f_down.weight":   gguf.MODEL_TENSOR.MEMT_F_DOWN,
+            "g_down.weight":   gguf.MODEL_TENSOR.MEMT_G_DOWN,
+            "decay_bias":      gguf.MODEL_TENSOR.MEMT_DECAY_BIAS,
+            "decay_scale_log": gguf.MODEL_TENSOR.MEMT_DECAY_SCALE,
+            "o_norm.weight":   gguf.MODEL_TENSOR.MEMT_O_NORM,
+        }
+        if suffix not in tensors:
+            raise ValueError(f"unexpected memt tensor {name}")
+        if suffix == "decay_scale_log":
+            # stored as the factor of the log decay
+            data_torch = -torch.exp(data_torch.float())
+        yield self.format_tensor_name(tensors[suffix], bid), data_torch
+
+
 @ModelBase.register("DFlashDraftModel", "DFlash2DraftModel")
 @ModelBase.example("z-lab/Qwen3.5-9B-DFlash")
 class DFlashModel(Qwen3Model):

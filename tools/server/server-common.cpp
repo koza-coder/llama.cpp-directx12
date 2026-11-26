@@ -1669,6 +1669,51 @@ json oaicompat_chat_params_parse(
 
     llama_params["prompt"] = out_session.prompt().str();
 
+    // MemT native memory: render each turn alone, without system prompt and tools
+    // a turn starts at a user message, the last turn is the current one
+    if (json_value(body, "memory_commit", false) || body.contains("memory_documents")) {
+        auto render = [&](const std::vector<common_chat_msg> & msgs, bool add_generation_prompt) {
+            common_chat_templates_inputs turn = inputs;
+            turn.messages               = msgs;
+            turn.tools                  = {};
+            turn.json_schema            = "";
+            turn.grammar                = "";
+            turn.add_generation_prompt  = add_generation_prompt;
+            turn.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+            return common_chat_templates_apply(opt.tmpls.get(), turn).prompt.str();
+        };
+
+        if (body.contains("memory_documents")) {
+            json docs = json::array();
+            for (const auto & doc : body.at("memory_documents")) {
+                common_chat_msg msg;
+                msg.role    = "user";
+                msg.content = doc.get<std::string>();
+                docs.push_back(render({ msg }, false));
+            }
+            llama_params["memory_documents"] = docs;
+        }
+
+        std::vector<std::vector<common_chat_msg>> turns;
+        for (const auto & msg : inputs.messages) {
+            if (msg.role == "system" || msg.role == "developer") {
+                continue;
+            }
+            if (msg.role == "user" || turns.empty()) {
+                turns.emplace_back();
+            }
+            turns.back().push_back(msg);
+        }
+        if (!turns.empty()) {
+            json past = json::array();
+            for (size_t i = 0; i + 1 < turns.size(); ++i) {
+                past.push_back(render(turns[i], false));
+            }
+            llama_params["memory_turns"]       = past;
+            llama_params["memory_turn_prompt"] = render(turns.back(), inputs.add_generation_prompt);
+        }
+    }
+
     // Reasoning budget: pass parameters through to sampling layer
     {
         int reasoning_budget = json_value(body, "reasoning_budget_tokens",

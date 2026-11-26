@@ -335,6 +335,10 @@ struct server_slot {
 
     std::vector<completion_token_output> generated_token_probs;
 
+    // MemT native memory
+    std::string  memt_key;       // memory used by the KV cache and loaded in the memory state ("" = none)
+    llama_tokens memt_generated; // all sampled tokens of the current task
+
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
@@ -350,6 +354,11 @@ struct server_slot {
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
+            return false;
+        }
+
+        // the cached state must not be reused with another memory
+        if (!memt_key.empty()) {
             return false;
         }
 
@@ -382,12 +391,26 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new) {
-        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id);
+        bool replaced = false;
+        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id, &replaced);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
 
+        // cached prompts are always made without memory
+        if (res && replaced) {
+            memt_clear();
+        }
+
         return res;
+    }
+
+    // the KV cache was made without memory, remove the memory state
+    void memt_clear() {
+        if (llama_memt_n_state(ctx_tgt) > 0) {
+            llama_memt_set_state(ctx_tgt, id, nullptr);
+        }
+        memt_key.clear();
     }
 
     void prompt_clear() {
@@ -441,6 +464,7 @@ struct server_slot {
 
         last_nl_pos    = 0;
         generated      = {};
+        memt_generated.clear();
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
@@ -1133,6 +1157,202 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+public:
+    // MemT native memory, the store is shared with the HTTP threads
+    struct memt_entry {
+        std::vector<float> data;
+        uint64_t           version = 0;
+    };
+
+    struct memt_commit {
+        int                       id_slot;
+        std::string               id;
+        std::vector<llama_tokens> turns;
+    };
+
+    std::mutex                        memt_mutex;
+    std::map<std::string, memt_entry> memt_store;
+    uint64_t                          memt_version_next = 1;
+    size_t                            memt_n_state      = 0;
+    std::vector<memt_commit>          memt_commits;
+
+private:
+
+    // decode the tokens on the slot with the memory commit enabled, from a clear KV cache
+    // state: the memory before the tokens, updated in place
+    void memt_decode(server_slot & slot, std::vector<float> & state, const llama_tokens & tokens) {
+        if ((int) tokens.size() > slot.n_ctx) {
+            throw std::runtime_error("memory turn is longer than the slot context (" + std::to_string(tokens.size()) + " tokens)");
+        }
+
+        slot.prompt_clear();
+        slot.memt_key = "-"; // the memory state does not match any entry now
+
+        llama_memt_set_state(ctx_tgt, slot.id, state.data());
+        llama_memt_set_commit(ctx_tgt, true);
+
+        const int32_t n_batch = llama_n_batch(ctx_tgt);
+        llama_batch batch = llama_batch_init(n_batch, 0, 1);
+
+        int ret = 0;
+        for (size_t i = 0; i < tokens.size() && ret == 0; i += n_batch) {
+            const size_t n = std::min<size_t>(n_batch, tokens.size() - i);
+            for (size_t j = 0; j < n; ++j) {
+                batch.token   [j]    = tokens[i + j];
+                batch.pos     [j]    = i + j;
+                batch.n_seq_id[j]    = 1;
+                batch.seq_id  [j][0] = slot.id;
+                batch.logits  [j]    = false;
+            }
+            batch.n_tokens = n;
+            ret = llama_decode(ctx_tgt, batch);
+        }
+        llama_batch_free(batch);
+
+        llama_memt_set_commit(ctx_tgt, false);
+        slot.prompt_clear();
+
+        if (ret != 0) {
+            throw std::runtime_error("memory commit decode failed (" + std::to_string(ret) + ")");
+        }
+
+        llama_memt_get_state(ctx_tgt, slot.id, state.data());
+    }
+
+    bool memt_prepare(server_slot & slot, const server_task & task) {
+        const auto & tp = task.params;
+
+        const bool use = !tp.memory_id.empty() || tp.memory_commit || !tp.memory_documents.empty();
+        if (use && memt_n_state == 0) {
+            send_error(task, "memory_id / memory_commit / memory_documents need a model with native memory", ERROR_TYPE_NOT_SUPPORTED);
+            return false;
+        }
+        if (use && tp.memory_id.empty()) {
+            send_error(task, "memory_commit / memory_documents need a memory_id", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+        if (use && (task.is_parent() || task.is_child())) {
+            send_error(task, "the native memory does not support n_cmpl > 1", ERROR_TYPE_NOT_SUPPORTED);
+            return false;
+        }
+        if (memt_n_state == 0) {
+            return true;
+        }
+
+        std::vector<float> data;
+        std::string key;
+
+        try {
+            if (!tp.memory_id.empty()) {
+                std::unique_lock<std::mutex> lock(memt_mutex);
+
+                auto it = memt_store.find(tp.memory_id);
+                if (it != memt_store.end()) {
+                    data = it->second.data;
+                }
+
+                if (!tp.memory_documents.empty()) {
+                    // documents: each chunk starts from a clear KV cache and reads the memory written so far
+                    if (data.empty()) {
+                        data.assign(memt_n_state, 0.0f);
+                    }
+                    const size_t n_chunk = llama_model_memt_chunk_size(model_tgt);
+                    for (const auto & doc : tp.memory_documents) {
+                        const llama_tokens tokens = common_tokenize(vocab, doc, false, true);
+                        for (size_t i = 0; i < tokens.size(); i += n_chunk) {
+                            memt_decode(slot, data, llama_tokens(tokens.begin() + i, tokens.begin() + std::min(tokens.size(), i + n_chunk)));
+                        }
+                    }
+                    memt_store[tp.memory_id] = { data, memt_version_next++ };
+                    SLT_INF(slot, "imported %zu documents into memory '%s'\n", tp.memory_documents.size(), tp.memory_id.c_str());
+                }
+
+                it = memt_store.find(tp.memory_id);
+                if (it != memt_store.end()) {
+                    key = tp.memory_id + ":" + std::to_string(it->second.version);
+                }
+            }
+        } catch (const std::exception & e) {
+            send_error(task, std::string("memory import failed: ") + e.what(), ERROR_TYPE_SERVER);
+            return false;
+        }
+
+        if (key != slot.memt_key) {
+            // the cached prompt was computed with another memory
+            slot.prompt_clear();
+            llama_memt_set_state(ctx_tgt, slot.id, data.empty() ? nullptr : data.data());
+            slot.memt_key = key;
+        }
+
+        return true;
+    }
+
+    void memt_queue_commit(server_slot & slot) {
+        const auto & tp = slot.task->params;
+        if (!tp.memory_commit || memt_n_state == 0) {
+            return;
+        }
+        // as the reference, only commit a turn that ended normally
+        if (slot.stop != STOP_TYPE_EOS && slot.stop != STOP_TYPE_WORD) {
+            SLT_WRN(slot, "generation did not end normally, memory '%s' is not updated\n", tp.memory_id.c_str());
+            return;
+        }
+
+        memt_commit job;
+        job.id_slot = slot.id;
+        job.id      = tp.memory_id;
+        for (const auto & turn : tp.memory_turns) {
+            job.turns.push_back(common_tokenize(vocab, turn, false, true));
+        }
+        llama_tokens cur = tp.memory_turn_prompt.empty()
+            ? slot.task->tokens.get_text_tokens()
+            : common_tokenize(vocab, tp.memory_turn_prompt, false, true);
+        cur.insert(cur.end(), slot.memt_generated.begin(), slot.memt_generated.end());
+        job.turns.push_back(std::move(cur));
+
+        memt_commits.push_back(std::move(job));
+    }
+
+    void memt_run_commits() {
+        for (auto & job : memt_commits) {
+            auto & slot = slots[job.id_slot];
+            GGML_ASSERT(!slot.is_processing());
+
+            const int64_t t_start = ggml_time_us();
+            size_t n_tokens = 0;
+
+            try {
+                std::unique_lock<std::mutex> lock(memt_mutex);
+
+                std::vector<float> data(memt_n_state, 0.0f);
+                auto it = memt_store.find(job.id);
+                if (it != memt_store.end()) {
+                    data = it->second.data;
+                }
+
+                // each turn starts from a clear KV cache and reads the memory written so far
+                for (const auto & turn : job.turns) {
+                    memt_decode(slot, data, turn);
+                    n_tokens += turn.size();
+                }
+
+                const uint64_t version = memt_version_next++;
+                llama_memt_set_state(ctx_tgt, slot.id, data.data());
+                slot.memt_key = job.id + ":" + std::to_string(version);
+                memt_store[job.id] = { std::move(data), version };
+            } catch (const std::exception & e) {
+                SLT_ERR(slot, "memory commit failed: %s\n", e.what());
+                slot.prompt_clear();
+                slot.memt_clear();
+                continue;
+            }
+
+            SLT_INF(slot, "committed %zu turns (%zu tokens) into memory '%s' in %.2f ms\n",
+                    job.turns.size(), n_tokens, job.id.c_str(), (ggml_time_us() - t_start) / 1000.0);
+        }
+        memt_commits.clear();
+    }
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1331,6 +1551,11 @@ private:
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        memt_n_state = ctx_tgt ? llama_memt_n_state(ctx_tgt) : 0;
+        if (memt_n_state > 0) {
+            SRV_INF("model has native memory, %zu floats per memory state\n", memt_n_state);
         }
 
         if (ctx_tgt == nullptr) {
@@ -2039,6 +2264,10 @@ private:
             slot.smpl.reset();
         }
 
+        if (!memt_prepare(slot, task)) {
+            return false;
+        }
+
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
@@ -2089,6 +2318,9 @@ private:
         slot.generated.append(token_str, result.tok);
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
+        }
+        if (slot.task->params.memory_commit) {
+            slot.memt_generated.push_back(result.tok);
         }
         slot.has_next_token = true;
 
@@ -2408,6 +2640,8 @@ private:
         res->generation_params = slot.task->params; // copy the parameters
 
         queue_results.send(std::move(res));
+
+        memt_queue_commit(slot);
     }
 
     void send_embedding(const server_slot & slot, const common_batch & batch) {
@@ -3273,6 +3507,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->memt_clear();
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3498,6 +3733,12 @@ private:
     }
 
     void update_slots() {
+        update_slots_impl();
+
+        memt_run_commits();
+    }
+
+    void update_slots_impl() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -5851,6 +6092,103 @@ void server_routes::init_routes() {
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    };
+
+    this->get_memory = [this](const server_http_req &) {
+        auto res = create_response(true);
+        json entries = json::array();
+        {
+            std::unique_lock<std::mutex> lock(ctx_server.memt_mutex);
+            for (const auto & [id, entry] : ctx_server.memt_store) {
+                entries.push_back({ { "id", id }, { "version", entry.version } });
+            }
+        }
+        res->ok({ { "n_state", ctx_server.memt_n_state }, { "memories", entries } });
+        return res;
+    };
+
+    this->post_memory = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (ctx_server.memt_n_state == 0) {
+            res->error(format_error_response("The model has no native memory", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const std::string id     = req.get_param("id");
+        const std::string action = req.get_param("action");
+
+        auto & mtx   = ctx_server.memt_mutex;
+        auto & store = ctx_server.memt_store;
+
+        if (action == "erase") {
+            std::unique_lock<std::mutex> lock(mtx);
+            const bool found = store.erase(id) > 0;
+            res->ok({ { "id", id }, { "erased", found } });
+            return res;
+        }
+
+        if (action != "save" && action != "restore") {
+            res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("Saving and restoring memory needs `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const json request_data = json::parse(req.body);
+        const std::string filename = request_data.at("filename");
+        if (!fs_validate_filename(filename)) {
+            res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string filepath = params.slot_save_path + filename;
+
+        // file: "MEMT", u32 format version, u64 number of floats, data
+        const uint32_t magic = 0x544d454d;
+        const uint32_t fmt   = 1;
+        const uint64_t n     = ctx_server.memt_n_state;
+
+        std::unique_lock<std::mutex> lock(mtx);
+
+        if (action == "save") {
+            auto it = store.find(id);
+            if (it == store.end()) {
+                res->error(format_error_response("Memory not found", ERROR_TYPE_NOT_FOUND));
+                return res;
+            }
+            std::ofstream f(filepath, std::ios::binary);
+            f.write((const char *) &magic, sizeof(magic));
+            f.write((const char *) &fmt, sizeof(fmt));
+            f.write((const char *) &n, sizeof(n));
+            f.write((const char *) it->second.data.data(), n*sizeof(float));
+            if (!f) {
+                res->error(format_error_response("Failed to write the memory file", ERROR_TYPE_SERVER));
+                return res;
+            }
+            res->ok({ { "id", id }, { "filename", filename }, { "n_written", sizeof(magic) + sizeof(fmt) + sizeof(n) + n*sizeof(float) } });
+            return res;
+        }
+
+        std::ifstream f(filepath, std::ios::binary);
+        uint32_t f_magic = 0, f_fmt = 0;
+        uint64_t f_n = 0;
+        f.read((char *) &f_magic, sizeof(f_magic));
+        f.read((char *) &f_fmt, sizeof(f_fmt));
+        f.read((char *) &f_n, sizeof(f_n));
+        if (!f || f_magic != magic || f_fmt != fmt || f_n != n) {
+            res->error(format_error_response("Invalid memory file or the file is for another model", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::vector<float> data(n);
+        f.read((char *) data.data(), n*sizeof(float));
+        if (!f) {
+            res->error(format_error_response("Truncated memory file", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        store[id] = { std::move(data), ctx_server.memt_version_next++ };
+        res->ok({ { "id", id }, { "filename", filename }, { "version", store[id].version } });
         return res;
     };
 

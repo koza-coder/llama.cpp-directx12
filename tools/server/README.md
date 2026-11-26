@@ -1317,6 +1317,48 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 }
 ```
 
+### Native memory (MemT models)
+
+Models with a native memory (e.g. `MemTensor/MemT-1.0-Nano`) keep a fixed-size memory state next to the attention layers. The server keeps memory states in RAM, by id. The completion endpoints (`/completion`, `/v1/chat/completions`, ...) accept these extra fields:
+
+- `memory_id`: id of the memory state that the model reads. A new id starts empty.
+- `memory_commit`: when the generation ends normally (EOS or a stop word), write the turns of this request into the memory. For chat requests, each turn (a user message and the messages after it, without the system prompt and tools) is rendered alone with the chat template and written in order. For `/completion`, the whole prompt and the generated tokens are written as one turn.
+- `memory_documents`: list of documents to write into the memory before the generation. For chat requests, each document is rendered as a user message.
+
+As with the reference implementation, the client keeps only the messages that are not in the memory yet. After a commit, send only the new messages with the same `memory_id`.
+
+```shell
+curl http://localhost:8080/v1/chat/completions -d '{
+  "messages": [{"role": "user", "content": "I have a kitten named memmy who loves small shrimp."}],
+  "memory_id": "alice", "memory_commit": true
+}'
+curl http://localhost:8080/v1/chat/completions -d '{
+  "messages": [{"role": "user", "content": "What is the name of my kitten?"}],
+  "memory_id": "alice"
+}'
+```
+
+The commit runs after the response is sent, before the next request starts. A cached prompt is only reused with the same memory version.
+
+### GET `/memory`: List the memory states
+
+```json
+{
+    "n_state": 10485760,
+    "memories": [{ "id": "alice", "version": 3 }]
+}
+```
+
+### POST `/memory/{id}?action=save`: Save a memory state to a file
+
+Needs `--slot-save-path`. Body: `{"filename": "alice.bin"}`
+
+### POST `/memory/{id}?action=restore`: Restore a memory state from a file
+
+Needs `--slot-save-path`. Body: `{"filename": "alice.bin"}`
+
+### POST `/memory/{id}?action=erase`: Remove a memory state
+
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
 This endpoint returns the loaded LoRA adapters. You can add adapters using `--lora` when starting the server, for example: `--lora my_adapter_1.gguf --lora my_adapter_2.gguf ...`

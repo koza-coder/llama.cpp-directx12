@@ -279,6 +279,22 @@ struct llama_layer_switch_lora {
     struct ggml_tensor * b_down = nullptr;
 };
 
+// MemT native memory branch, next to the full attention layers
+struct llama_layer_memt {
+    struct ggml_tensor * wq          = nullptr;
+    struct ggml_tensor * wk          = nullptr;
+    struct ggml_tensor * wv          = nullptr;
+    struct ggml_tensor * wb          = nullptr; // erase gate
+    struct ggml_tensor * ww          = nullptr; // write gate
+    struct ggml_tensor * wf          = nullptr; // forget gate, low rank
+    struct ggml_tensor * wg          = nullptr; // output gate, low rank
+    struct ggml_tensor * f_down      = nullptr;
+    struct ggml_tensor * g_down      = nullptr;
+    struct ggml_tensor * decay_bias  = nullptr;
+    struct ggml_tensor * decay_scale = nullptr; // -exp(decay_scale_log)
+    struct ggml_tensor * o_norm      = nullptr;
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -721,6 +737,8 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 
     struct llama_layer_switch_lora switch_lora;
+
+    struct llama_layer_memt memt;
 };
 
 struct llama_device {

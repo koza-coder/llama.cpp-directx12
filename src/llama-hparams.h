@@ -214,6 +214,10 @@ struct llama_hparams {
     uint32_t ssm_n_group = 0;
     float    ssm_norm_eps = 0.0f; // 0 = use f_norm_rms_eps
 
+    // for MemT native memory (0 = model has no memory branch)
+    uint32_t memt_chunk_size    = 0;
+    float    memt_gate_softcap  = 0.0f;
+
     // for MiniMax-Text-01 linear attention
     uint32_t n_embd_head_la = 0;
 

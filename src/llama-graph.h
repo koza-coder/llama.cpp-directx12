@@ -22,6 +22,8 @@ struct llama_layer;
 struct llama_model;
 struct llama_prec_policy;
 struct llama_hadamard;
+struct llama_memt;
+struct llama_layer_memt;
 
 class llama_moe_cache;
 
@@ -280,6 +282,20 @@ public:
     ggml_tensor * ids = nullptr; // I32 [n_expert_used_max, n_tokens]
 
     const int64_t n_expert;
+};
+
+class llm_graph_input_memt : public llm_graph_input_i {
+public:
+    llm_graph_input_memt(const llama_memt * memt) : memt(memt) {}
+    virtual ~llm_graph_input_memt() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * seq_ids = nullptr; // I32 [n_seqs]
+
+    const llama_memt * memt;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -859,6 +875,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_memt             * memt = nullptr;
 
     ggml_tensor * layer_inp_dev = nullptr; // own layer input device buffer (write)
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
@@ -957,6 +974,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.memt_read               == other.cparams.memt_read               &&
+            cparams.memt_commit             == other.cparams.memt_commit             &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&
             h_nextn_dev   == other.h_nextn_dev   &&
@@ -1133,6 +1152,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_memt             * memt;
 
     const llama_hadamard * hdmd;
 
@@ -1312,6 +1332,18 @@ struct llm_graph_context {
     ggml_tensor * build_rope_indexer(ggml_tensor * cur, ggml_tensor * pos, int il) const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
+
+    // returns nullptr when the MemT memory is not used by this graph
+    llm_graph_input_memt * build_inp_memt() const;
+
+    // MemT memory attention: read from the snapshot, write the state during a commit
+    // cur: input of the attention layer [n_embd, n_tokens], returns [S*H, n_tokens]
+    ggml_tensor * build_memt(
+            llm_graph_input_memt * inp,
+            const llama_layer_memt & layer,
+                     ggml_tensor * cur,
+                             int   il) const;
+
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
     ggml_tensor * build_inp_moe_ids(int64_t n_used, int64_t n_rows) const;
