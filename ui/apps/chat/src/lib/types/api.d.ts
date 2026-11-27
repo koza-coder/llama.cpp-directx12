@@ -320,6 +320,9 @@ export interface ApiChatCompletionRequest {
 	return_progress?: boolean;
 	sse_ping_interval?: number;
 	tools?: ApiChatCompletionTool[];
+	// MemT native memory (server README "Native memory")
+	memory_id?: string;
+	memory_commit?: boolean;
 	// Reasoning parameters
 	reasoning_format?: string;
 	reasoning_effort?: string;

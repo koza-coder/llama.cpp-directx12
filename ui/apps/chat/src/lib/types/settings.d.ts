@@ -79,6 +79,9 @@ export interface SettingsSection {
 
 export interface SettingsChatServiceOptions {
 	stream?: boolean;
+	// MemT native memory: memory id to read, and write this turn into it
+	memoryId?: string;
+	memoryCommit?: boolean;
 	// Model (required in ROUTER mode, optional in MODEL mode)
 	model?: string;
 	// System message to inject

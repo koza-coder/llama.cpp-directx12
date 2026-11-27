@@ -9,6 +9,7 @@
  * Uses ChatService for the API layer and conversationsStore for persistence.
  */
 
+import { memoryStore } from '#lib/stores/memory.svelte.ts';
 import {
 	COMPACTION,
 	CWD_CLEARED_TEXT,
@@ -1266,6 +1267,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				messages: allMessages,
 				options: {
 					...this.getApiOptions(),
+					...memoryStore.options(),
 					...(effectiveModel ? { model: effectiveModel } : {})
 				},
 				signal: abortController.signal,
@@ -1293,6 +1295,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			allMessages,
 			{
 				...this.getApiOptions(),
+				...memoryStore.options(),
 				...(effectiveModel ? { model: effectiveModel } : {}),
 				onChunk: streamCallbacks.onChunk,
 				onComplete: async (

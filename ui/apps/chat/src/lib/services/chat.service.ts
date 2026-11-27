@@ -1113,6 +1113,8 @@ export class ChatService {
 			excludeReasoningFromContext,
 			frequency_penalty,
 			max_tokens,
+			memoryCommit,
+			memoryId,
 			min_p,
 			onChunk,
 			onComplete,
@@ -1197,6 +1199,28 @@ export class ChatService {
 			stream,
 			tools: tools && tools.length > 0 ? tools : undefined
 		};
+
+		// MemT native memory: with a commit the memory holds the earlier turns, so only the
+		// current turn (from the last user message) goes with the system messages
+		if (memoryId) {
+			requestBody.memory_id = memoryId;
+
+			if (memoryCommit) {
+				requestBody.memory_commit = true;
+
+				const msgs = requestBody.messages;
+				let lastUser = msgs.length - 1;
+
+				while (lastUser > 0 && msgs[lastUser].role !== 'user') lastUser--;
+
+				if (lastUser > 0) {
+					requestBody.messages = [
+						...msgs.slice(0, lastUser).filter((msg: ApiChatCompletionRequest['messages'][0]) => msg.role === 'system'),
+						...msgs.slice(lastUser)
+					];
+				}
+			}
+		}
 
 		// Include model in request if provided (required in ROUTER mode)
 		if (options.model) {

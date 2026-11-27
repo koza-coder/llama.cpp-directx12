@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { ChatForm } from '#lib/components/app/index.ts';
+	import ChatScreenMemory from './ChatScreenMemory.svelte';
 	import { SETTINGS_KEYS } from '#lib/constants/index.ts';
 	import { useDraftMessages } from '#lib/hooks/use-draft-messages.svelte.ts';
 	import { deviceStore, settingsStore } from '#lib/stores/index.ts';
@@ -174,4 +175,6 @@
 		onUploadedFileRemove={handleUploadedFileRemove}
 		singleRow={settingsStore.config[SETTINGS_KEYS.SINGLE_ROW_CHAT_FORM] !== false}
 	/>
+
+	<ChatScreenMemory {isLoading} />
 </div>
